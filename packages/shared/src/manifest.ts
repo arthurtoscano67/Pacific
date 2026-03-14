@@ -18,6 +18,23 @@ const walrusAssetSchema = z.object({
   size: z.number().int().nonnegative(),
 });
 
+export const walrusBlobStorageSchema = z.object({
+  blobId: z.string().min(1),
+  blobObjectId: z.string().startsWith("0x"),
+  startEpoch: z.number().int().nonnegative().nullable().optional(),
+  endEpoch: z.number().int().positive().nullable().optional(),
+  deletable: z.boolean().nullable().optional(),
+});
+
+export const walrusAvatarStorageSchema = z.object({
+  runtimeAvatar: walrusBlobStorageSchema.nullable(),
+  preview: walrusBlobStorageSchema.nullable(),
+  manifest: walrusBlobStorageSchema.nullable(),
+  sourceAsset: walrusBlobStorageSchema.nullable().optional(),
+  minimumEndEpoch: z.number().int().positive().nullable().optional(),
+  maximumEndEpoch: z.number().int().positive().nullable().optional(),
+});
+
 const runtimeAvatarVrmSchema = walrusAssetSchema.extend({
   mime: z.literal(READY_AVATAR_VRM_MIME),
   filename: z.string().toLowerCase().endsWith(".vrm"),
@@ -173,6 +190,7 @@ export const manifestRecordSchema = z.object({
   avatarObjectId: z.string().startsWith("0x"),
   transactionDigest: z.string().optional(),
   epochs: z.number().int().positive(),
+  walrusStorage: walrusAvatarStorageSchema.optional(),
   runtimeReady: z.boolean().default(false),
 });
 
@@ -194,6 +212,8 @@ export type ShooterGameMetadata = z.infer<typeof shooterGameMetadataSchema>;
 export type WalletSessionRequest = z.infer<typeof walletSessionRequestSchema>;
 export type UploadIntentRequest = z.infer<typeof uploadIntentSchema>;
 export type ManifestRecord = z.infer<typeof manifestRecordSchema>;
+export type WalrusBlobStorage = z.infer<typeof walrusBlobStorageSchema>;
+export type WalrusAvatarStorage = z.infer<typeof walrusAvatarStorageSchema>;
 
 export function parseReadyAvatarManifest(payload: unknown): ReadyAvatarManifest {
   const current = readyAvatarManifestSchema.safeParse(payload);

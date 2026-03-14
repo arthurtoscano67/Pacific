@@ -18,6 +18,8 @@ public struct Avatar has key, store {
     description: String,
     manifest_blob_id: String,
     preview_blob_id: String,
+    preview_url: String,
+    project_url: String,
     schema_version: u64,
 }
 
@@ -65,14 +67,14 @@ fun init(witness: AVATAR, ctx: &mut TxContext) {
         vector[
             string::utf8(b"name"),
             string::utf8(b"description"),
-            string::utf8(b"image_url"),
-            string::utf8(b"project_url"),
+            string::utf8(b"image"),
+            string::utf8(b"link"),
         ],
         vector[
             string::utf8(b"{name}"),
             string::utf8(b"{description}"),
-            string::utf8(b"walrus://{preview_blob_id}"),
-            string::utf8(b"https://pacific.ready-avatar.local"),
+            string::utf8(b"{preview_url}"),
+            string::utf8(b"{project_url}"),
         ],
         ctx,
     );
@@ -88,6 +90,8 @@ public fun mint(
     description: String,
     manifest_blob_id: String,
     preview_blob_id: String,
+    preview_url: String,
+    project_url: String,
     schema_version: u64,
     ctx: &mut TxContext,
 ) {
@@ -98,6 +102,8 @@ public fun mint(
         description,
         manifest_blob_id,
         preview_blob_id,
+        preview_url,
+        project_url,
         schema_version,
     };
 
@@ -118,6 +124,8 @@ public fun update(
     description: String,
     manifest_blob_id: String,
     preview_blob_id: String,
+    preview_url: String,
+    project_url: String,
     schema_version: u64,
     ctx: &TxContext,
 ) {
@@ -125,6 +133,8 @@ public fun update(
     avatar.description = description;
     avatar.manifest_blob_id = manifest_blob_id;
     avatar.preview_blob_id = preview_blob_id;
+    avatar.preview_url = preview_url;
+    avatar.project_url = project_url;
     avatar.schema_version = schema_version;
 
     event::emit(AvatarUpdated {
@@ -188,6 +198,14 @@ public fun manifest_blob_id(avatar: &Avatar): &String {
 
 public fun preview_blob_id(avatar: &Avatar): &String {
     &avatar.preview_blob_id
+}
+
+public fun preview_url(avatar: &Avatar): &String {
+    &avatar.preview_url
+}
+
+public fun project_url(avatar: &Avatar): &String {
+    &avatar.project_url
 }
 
 public fun schema_version(avatar: &Avatar): u64 {

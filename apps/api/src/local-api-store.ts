@@ -1,6 +1,7 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import type { WalrusAvatarStorage } from "@pacific/shared";
 
 type LocalWalletSessionEntry = {
   tokenHash: string;
@@ -21,6 +22,7 @@ export type LocalManifestRecordEntry = {
   transactionDigest: string | null;
   manifestJson: unknown;
   epochs: number;
+  walrusStorage: WalrusAvatarStorage | null;
   validationStatus: string;
   validationErrors: string[];
   runtimeReady: boolean;
@@ -110,6 +112,7 @@ function normalizeManifestEntry(
       typeof value.epochs === "number" && Number.isFinite(value.epochs) && value.epochs > 0
         ? Math.floor(value.epochs)
         : 0,
+    walrusStorage: normalizeWalrusStorage(value.walrusStorage),
     validationStatus:
       typeof value.validationStatus === "string" && value.validationStatus.length > 0
         ? value.validationStatus
@@ -126,6 +129,74 @@ function normalizeManifestEntry(
       typeof value.updatedAt === "string" && value.updatedAt.length > 0
         ? value.updatedAt
         : new Date(0).toISOString(),
+  };
+}
+
+function normalizeWalrusBlobStorage(
+  value:
+    | {
+        blobId?: unknown;
+        blobObjectId?: unknown;
+        startEpoch?: unknown;
+        endEpoch?: unknown;
+        deletable?: unknown;
+      }
+    | null
+    | undefined,
+) {
+  if (
+    !value ||
+    typeof value.blobId !== "string" ||
+    value.blobId.length === 0 ||
+    typeof value.blobObjectId !== "string" ||
+    value.blobObjectId.length === 0
+  ) {
+    return null;
+  }
+
+  const startEpoch = Number(value.startEpoch);
+  const endEpoch = Number(value.endEpoch);
+
+  return {
+    blobId: value.blobId,
+    blobObjectId: value.blobObjectId,
+    startEpoch:
+      Number.isFinite(startEpoch) && startEpoch >= 0 ? Math.floor(startEpoch) : null,
+    endEpoch: Number.isFinite(endEpoch) && endEpoch > 0 ? Math.floor(endEpoch) : null,
+    deletable: typeof value.deletable === "boolean" ? value.deletable : null,
+  };
+}
+
+function normalizeWalrusStorage(value: unknown): WalrusAvatarStorage | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+
+  const payload = value as {
+    runtimeAvatar?: unknown;
+    preview?: unknown;
+    manifest?: unknown;
+    sourceAsset?: unknown;
+    minimumEndEpoch?: unknown;
+    maximumEndEpoch?: unknown;
+  };
+
+  const minimumEndEpoch = Number(payload.minimumEndEpoch);
+  const maximumEndEpoch = Number(payload.maximumEndEpoch);
+
+  return {
+    runtimeAvatar: normalizeWalrusBlobStorage(payload.runtimeAvatar as never),
+    preview: normalizeWalrusBlobStorage(payload.preview as never),
+    manifest: normalizeWalrusBlobStorage(payload.manifest as never),
+    sourceAsset: normalizeWalrusBlobStorage(payload.sourceAsset as never),
+    minimumEndEpoch:
+      Number.isFinite(minimumEndEpoch) && minimumEndEpoch > 0
+        ? Math.floor(minimumEndEpoch)
+        : null,
+    maximumEndEpoch:
+      Number.isFinite(maximumEndEpoch) && maximumEndEpoch > 0
+        ? Math.floor(maximumEndEpoch)
+        : null,
   };
 }
 

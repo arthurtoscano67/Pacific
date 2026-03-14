@@ -1,4 +1,4 @@
-export type SiteRoute = "create" | "play" | "world" | "unity";
+export type SiteRoute = "start" | "create" | "unity";
 
 type TabDescriptor = {
   route: SiteRoute;
@@ -8,13 +8,18 @@ type TabDescriptor = {
 
 const tabs: TabDescriptor[] = [
   {
+    route: "start",
+    label: "Home",
+    href: "/",
+  },
+  {
     route: "create",
-    label: "Forge Operator",
+    label: "Mint",
     href: "/create",
   },
   {
     route: "unity",
-    label: "Deploy Runtime",
+    label: "Play",
     href: "/unity",
   },
 ];

@@ -1,5 +1,5 @@
 import { webEnv } from "../env";
-import type { ShooterCharacter, ShooterStats } from "@pacific/shared";
+import type { ShooterCharacter, ShooterStats, WalrusAvatarStorage } from "@pacific/shared";
 
 function normalizeShooterStats(value: unknown): ShooterStats {
   if (!value || typeof value !== "object") {
@@ -31,7 +31,59 @@ export type BackendOwnedAvatar = {
   source: "active-wallet" | "object-state" | "manifest-cache" | "on-chain";
   shooterStats: ShooterStats;
   shooterCharacter: ShooterCharacter | null;
+  walrusStorage: WalrusAvatarStorage | null;
 };
+
+function normalizeWalrusBlobStorage(value: unknown) {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+
+  const payload = value as Record<string, unknown>;
+  if (
+    typeof payload.blobId !== "string" ||
+    typeof payload.blobObjectId !== "string"
+  ) {
+    return null;
+  }
+
+  const startEpoch = Number(payload.startEpoch);
+  const endEpoch = Number(payload.endEpoch);
+
+  return {
+    blobId: payload.blobId,
+    blobObjectId: payload.blobObjectId,
+    startEpoch:
+      Number.isFinite(startEpoch) && startEpoch >= 0 ? Math.floor(startEpoch) : null,
+    endEpoch: Number.isFinite(endEpoch) && endEpoch > 0 ? Math.floor(endEpoch) : null,
+    deletable: typeof payload.deletable === "boolean" ? payload.deletable : null,
+  };
+}
+
+function normalizeWalrusStorage(value: unknown): WalrusAvatarStorage | null {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+
+  const payload = value as Record<string, unknown>;
+  const minimumEndEpoch = Number(payload.minimumEndEpoch);
+  const maximumEndEpoch = Number(payload.maximumEndEpoch);
+
+  return {
+    runtimeAvatar: normalizeWalrusBlobStorage(payload.runtimeAvatar),
+    preview: normalizeWalrusBlobStorage(payload.preview),
+    manifest: normalizeWalrusBlobStorage(payload.manifest),
+    sourceAsset: normalizeWalrusBlobStorage(payload.sourceAsset),
+    minimumEndEpoch:
+      Number.isFinite(minimumEndEpoch) && minimumEndEpoch > 0
+        ? Math.floor(minimumEndEpoch)
+        : null,
+    maximumEndEpoch:
+      Number.isFinite(maximumEndEpoch) && maximumEndEpoch > 0
+        ? Math.floor(maximumEndEpoch)
+        : null,
+  };
+}
 
 export type BackendOwnedAvatarResponse = {
   walletAddress: string;
@@ -76,6 +128,7 @@ function normalizeAvatar(value: unknown): BackendOwnedAvatar | null {
     isActive: Boolean(payload.isActive),
     source,
     shooterStats: normalizeShooterStats(payload.shooterStats),
+    walrusStorage: normalizeWalrusStorage(payload.walrusStorage),
     shooterCharacter:
       payload.shooterCharacter &&
       typeof payload.shooterCharacter === "object" &&

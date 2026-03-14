@@ -139,8 +139,24 @@ export async function initDatabase(sql: OptionalDatabase) {
       wallet_address text not null,
       start_epoch bigint,
       end_epoch bigint,
+      deletable boolean,
       updated_at timestamptz not null default now()
     )
+  `;
+
+  await sql`
+    alter table walrus_asset_expiry
+    add column if not exists start_epoch bigint
+  `;
+
+  await sql`
+    alter table walrus_asset_expiry
+    add column if not exists end_epoch bigint
+  `;
+
+  await sql`
+    alter table walrus_asset_expiry
+    add column if not exists deletable boolean
   `;
 
   await sql`

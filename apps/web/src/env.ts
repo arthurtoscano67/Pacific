@@ -12,7 +12,7 @@ export const webEnv = {
     import.meta.env.VITE_WALRUS_UPLOAD_RELAY_URL,
     "https://upload-relay.mainnet.walrus.space",
   ),
-  walrusEpochs: Number(import.meta.env.VITE_WALRUS_EPOCHS ?? "52"),
+  walrusEpochs: Number(import.meta.env.VITE_WALRUS_EPOCHS ?? "53"),
   walrusMaxTipMist: Number(import.meta.env.VITE_WALRUS_MAX_TIP_MIST ?? "100000000"),
   walrusRequestTimeoutMs: Number(import.meta.env.VITE_WALRUS_REQUEST_TIMEOUT_MS ?? "3600000"),
   maxSourceAssetMb: Number(import.meta.env.VITE_MAX_SOURCE_ASSET_MB ?? "250"),

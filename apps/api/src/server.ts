@@ -8,11 +8,14 @@ import {
   readyAvatarManifestSchema,
   READY_AVATAR_MANIFEST_MIME,
   READY_AVATAR_DEFAULT_MAX_SOURCE_ASSET_BYTES,
+  walrusAvatarStorageSchema,
   uploadIntentSchema,
   validatePlayableAvatarUpload,
   walletSessionRequestSchema,
   type ShooterCharacter,
   type ShooterStats,
+  type WalrusAvatarStorage,
+  type WalrusBlobStorage,
 } from "@pacific/shared";
 import { apiConfig } from "./config.js";
 import { createWalletSession, requireWalletSession } from "./auth.js";
@@ -63,6 +66,11 @@ type AvatarObjectStateRow = {
 type AvatarManifestRow = {
   avatar_object_id: string;
   manifest_blob_id: string;
+  avatar_blob_id: string;
+  avatar_blob_object_id: string;
+  preview_blob_id: string;
+  preview_blob_object_id: string;
+  manifest_blob_object_id: string;
   transaction_digest: string | null;
   validation_status: string | null;
   runtime_ready: boolean | null;
@@ -82,6 +90,7 @@ type AvatarLookupCandidate = {
   shooterStats: ShooterStats;
   shooterCharacter: ShooterCharacter | null;
   shooterStatsUpdatedAt: string | null;
+  walrusStorage: WalrusAvatarStorage | null;
   updatedAt: string | null;
   isActive: boolean;
   source: "active-wallet" | "object-state" | "manifest-cache" | "on-chain";
@@ -93,6 +102,16 @@ type AvatarShooterStatsRow = {
   wins: number;
   losses: number;
   hp: number;
+  updated_at: string;
+};
+
+type WalrusAssetExpiryRow = {
+  blob_object_id: string;
+  blob_id: string;
+  wallet_address: string;
+  start_epoch: number | string | null;
+  end_epoch: number | string | null;
+  deletable: boolean | null;
   updated_at: string;
 };
 
@@ -338,6 +357,123 @@ function parseManifestRuntimePointers(payload: unknown): {
   }
 }
 
+function parseManifestStoragePointers(payload: unknown): {
+  runtimeAvatarBlobId: string | null;
+  runtimeAvatarBlobObjectId: string | null;
+  previewBlobId: string | null;
+  previewBlobObjectId: string | null;
+  sourceAssetBlobId: string | null;
+  sourceAssetBlobObjectId: string | null;
+} {
+  try {
+    const manifest = parseReadyAvatarManifest(payload);
+    return {
+      runtimeAvatarBlobId: manifest.runtimeAvatar.blobId,
+      runtimeAvatarBlobObjectId: manifest.runtimeAvatar.blobObjectId ?? null,
+      previewBlobId: manifest.preview.blobId,
+      previewBlobObjectId: manifest.preview.blobObjectId ?? null,
+      sourceAssetBlobId: manifest.sourceAsset?.blobId ?? null,
+      sourceAssetBlobObjectId: manifest.sourceAsset?.blobObjectId ?? null,
+    };
+  } catch {
+    return {
+      runtimeAvatarBlobId: lookupStringField(payload, [
+        "runtimeAvatarBlobId",
+        "runtime_avatar_blob_id",
+        "avatarBlobId",
+      ]),
+      runtimeAvatarBlobObjectId: lookupStringField(payload, [
+        "runtimeAvatarBlobObjectId",
+        "runtime_avatar_blob_object_id",
+        "avatarBlobObjectId",
+      ]),
+      previewBlobId: lookupStringField(payload, [
+        "previewBlobId",
+        "preview_blob_id",
+      ]),
+      previewBlobObjectId: lookupStringField(payload, [
+        "previewBlobObjectId",
+        "preview_blob_object_id",
+      ]),
+      sourceAssetBlobId: lookupStringField(payload, [
+        "sourceAssetBlobId",
+        "source_asset_blob_id",
+      ]),
+      sourceAssetBlobObjectId: lookupStringField(payload, [
+        "sourceAssetBlobObjectId",
+        "source_asset_blob_object_id",
+      ]),
+    };
+  }
+}
+
+function normalizeWalrusBlobStorage(
+  value:
+    | {
+        blobId?: unknown;
+        blobObjectId?: unknown;
+        startEpoch?: unknown;
+        endEpoch?: unknown;
+        deletable?: unknown;
+      }
+    | null
+    | undefined,
+): WalrusBlobStorage | null {
+  if (
+    !value ||
+    typeof value.blobId !== "string" ||
+    value.blobId.length === 0 ||
+    typeof value.blobObjectId !== "string" ||
+    value.blobObjectId.length === 0
+  ) {
+    return null;
+  }
+
+  const startEpoch = Number(value.startEpoch);
+  const endEpoch = Number(value.endEpoch);
+
+  return {
+    blobId: value.blobId,
+    blobObjectId: value.blobObjectId,
+    startEpoch:
+      Number.isFinite(startEpoch) && startEpoch >= 0 ? Math.floor(startEpoch) : null,
+    endEpoch: Number.isFinite(endEpoch) && endEpoch > 0 ? Math.floor(endEpoch) : null,
+    deletable: typeof value.deletable === "boolean" ? value.deletable : null,
+  };
+}
+
+function summarizeWalrusAvatarStorage(args: {
+  runtimeAvatar?: Partial<WalrusBlobStorage> | null;
+  preview?: Partial<WalrusBlobStorage> | null;
+  manifest?: Partial<WalrusBlobStorage> | null;
+  sourceAsset?: Partial<WalrusBlobStorage> | null;
+}): WalrusAvatarStorage | null {
+  const runtimeAvatar = normalizeWalrusBlobStorage(args.runtimeAvatar);
+  const preview = normalizeWalrusBlobStorage(args.preview);
+  const manifest = normalizeWalrusBlobStorage(args.manifest);
+  const sourceAsset = normalizeWalrusBlobStorage(args.sourceAsset);
+  const assets = [runtimeAvatar, preview, manifest, sourceAsset].filter(
+    (asset): asset is WalrusBlobStorage => Boolean(asset),
+  );
+
+  if (assets.length === 0) {
+    return null;
+  }
+
+  const endEpochs = assets
+    .map((asset) => asset.endEpoch)
+    .filter((value): value is number => typeof value === "number" && Number.isFinite(value));
+
+  return {
+    runtimeAvatar,
+    preview,
+    manifest,
+    sourceAsset,
+    minimumEndEpoch: endEpochs.length > 0 ? Math.min(...endEpochs) : null,
+    maximumEndEpoch: endEpochs.length > 0 ? Math.max(...endEpochs) : null,
+  };
+}
+
 function buildApiBaseUrl(
   request: {
     protocol: string;
@@ -386,9 +522,66 @@ function mergeAvatarCandidate(
       getTimestampValue(current.shooterStatsUpdatedAt)
         ? next.shooterStatsUpdatedAt
         : current.shooterStatsUpdatedAt,
+    walrusStorage: next.walrusStorage ?? current.walrusStorage,
     updatedAt: useNextTimestamp ? next.updatedAt : current.updatedAt,
     isActive: current.isActive || next.isActive,
     source: useNextTimestamp ? next.source : current.source,
+  });
+}
+
+function buildWalrusAssetStorageFromExpiryRow(
+  row: WalrusAssetExpiryRow | undefined,
+  fallback: {
+    blobId: string | null;
+    blobObjectId: string | null;
+  },
+) {
+  return normalizeWalrusBlobStorage({
+    blobId: row?.blob_id ?? fallback.blobId ?? undefined,
+    blobObjectId: row?.blob_object_id ?? fallback.blobObjectId ?? undefined,
+    startEpoch: row?.start_epoch ?? null,
+    endEpoch: row?.end_epoch ?? null,
+    deletable: row?.deletable ?? null,
+  });
+}
+
+function buildWalrusStorageFromManifestRow(
+  row: AvatarManifestRow,
+  expiryRowsByBlobObjectId: Map<string, WalrusAssetExpiryRow>,
+) {
+  const pointers = parseManifestStoragePointers(row.manifest_json);
+  return summarizeWalrusAvatarStorage({
+    runtimeAvatar: buildWalrusAssetStorageFromExpiryRow(
+      expiryRowsByBlobObjectId.get(row.avatar_blob_object_id),
+      {
+        blobId: row.avatar_blob_id,
+        blobObjectId: row.avatar_blob_object_id,
+      },
+    ),
+    preview: buildWalrusAssetStorageFromExpiryRow(
+      expiryRowsByBlobObjectId.get(row.preview_blob_object_id),
+      {
+        blobId: row.preview_blob_id,
+        blobObjectId: row.preview_blob_object_id,
+      },
+    ),
+    manifest: buildWalrusAssetStorageFromExpiryRow(
+      expiryRowsByBlobObjectId.get(row.manifest_blob_object_id),
+      {
+        blobId: row.manifest_blob_id,
+        blobObjectId: row.manifest_blob_object_id,
+      },
+    ),
+    sourceAsset:
+      pointers.sourceAssetBlobId && pointers.sourceAssetBlobObjectId
+        ? buildWalrusAssetStorageFromExpiryRow(
+            expiryRowsByBlobObjectId.get(pointers.sourceAssetBlobObjectId),
+            {
+              blobId: pointers.sourceAssetBlobId,
+              blobObjectId: pointers.sourceAssetBlobObjectId,
+            },
+          )
+        : null,
   });
 }
 
@@ -424,6 +617,7 @@ function mapOnChainAvatarToLookupCandidate(
     shooterCharacter: avatar.shooterCharacter,
     shooterStats: normalizeShooterStats(avatar.shooterStats),
     shooterStatsUpdatedAt: null,
+    walrusStorage: null,
     updatedAt: null,
     isActive,
     source: "on-chain",
@@ -487,6 +681,7 @@ function mapLocalManifestEntryToLookupCandidate(
     shooterCharacter: metadata.shooterCharacter,
     shooterStats: metadata.shooterStats,
     shooterStatsUpdatedAt: entry.updatedAt,
+    walrusStorage: entry.walrusStorage,
     updatedAt: entry.updatedAt,
     isActive,
     source: "manifest-cache",
@@ -506,7 +701,8 @@ async function buildVerifiedOwnedAvatarState(
   let activeManifestBlobId = chainOwned[0]?.manifestBlobId ?? null;
 
   if (sql) {
-    const [activeRows, objectStateRows, manifestRows, shooterStatsRows] = await Promise.all([
+    const [activeRows, objectStateRows, manifestRows, shooterStatsRows, walrusExpiryRows] =
+      await Promise.all([
       sql`
         select wallet_address, avatar_object_id, manifest_blob_id, updated_at
         from avatar_active_wallet
@@ -524,6 +720,11 @@ async function buildVerifiedOwnedAvatarState(
         select
           avatar_object_id,
           manifest_blob_id,
+          avatar_blob_id,
+          avatar_blob_object_id,
+          preview_blob_id,
+          preview_blob_object_id,
+          manifest_blob_object_id,
           transaction_digest,
           validation_status,
           runtime_ready,
@@ -539,12 +740,18 @@ async function buildVerifiedOwnedAvatarState(
         from avatar_shooter_stats
         where wallet_address = ${walletAddress}
       `,
+      sql`
+        select blob_object_id, blob_id, wallet_address, start_epoch, end_epoch, deletable, updated_at
+        from walrus_asset_expiry
+        where wallet_address = ${walletAddress}
+      `,
     ]);
 
     const active = activeRows[0] as ActiveAvatarRow | undefined;
     const objectStateRowsTyped = objectStateRows as unknown as AvatarObjectStateRow[];
     const manifestRowsTyped = manifestRows as unknown as AvatarManifestRow[];
     const shooterStatsRowsTyped = shooterStatsRows as unknown as AvatarShooterStatsRow[];
+    const walrusExpiryRowsTyped = walrusExpiryRows as unknown as WalrusAssetExpiryRow[];
     const shooterStatsMap = new Map<
       string,
       {
@@ -552,6 +759,9 @@ async function buildVerifiedOwnedAvatarState(
         updatedAt: string | null;
       }
     >();
+    const walrusExpiryMap = new Map(
+      walrusExpiryRowsTyped.map((row) => [row.blob_object_id, row]),
+    );
 
     for (const row of shooterStatsRowsTyped) {
       shooterStatsMap.set(row.avatar_object_id, {
@@ -582,6 +792,7 @@ async function buildVerifiedOwnedAvatarState(
         shooterCharacter: null,
         shooterStats: shooterState?.stats ?? defaultShooterStats(),
         shooterStatsUpdatedAt: shooterState?.updatedAt ?? null,
+        walrusStorage: null,
         updatedAt: row.updated_at,
         isActive: active?.avatar_object_id === row.avatar_object_id,
         source: "object-state",
@@ -607,6 +818,7 @@ async function buildVerifiedOwnedAvatarState(
         shooterCharacter: metadata.shooterCharacter,
         shooterStats: shooterState?.stats ?? metadata.shooterStats,
         shooterStatsUpdatedAt: shooterState?.updatedAt ?? row.updated_at,
+        walrusStorage: buildWalrusStorageFromManifestRow(row, walrusExpiryMap),
         updatedAt: row.updated_at,
         isActive: active?.avatar_object_id === row.avatar_object_id,
         source: "manifest-cache",
@@ -1130,6 +1342,31 @@ app.post("/avatar/manifest", async (request, reply) => {
     avatarPlayable && record.runtimeReady ? "playable" :
     avatarPlayable ? "stored" :
     "invalid";
+  const walrusStorage = summarizeWalrusAvatarStorage({
+    runtimeAvatar:
+      record.walrusStorage?.runtimeAvatar ?? {
+        blobId: record.avatarBlobId,
+        blobObjectId: record.avatarBlobObjectId,
+      },
+    preview:
+      record.walrusStorage?.preview ?? {
+        blobId: record.previewBlobId,
+        blobObjectId: record.previewBlobObjectId,
+      },
+    manifest:
+      record.walrusStorage?.manifest ?? {
+        blobId: record.manifestBlobId,
+        blobObjectId: record.manifestBlobObjectId,
+      },
+    sourceAsset:
+      record.walrusStorage?.sourceAsset ??
+      (record.sourceAssetBlobId && record.sourceAssetBlobObjectId
+        ? {
+            blobId: record.sourceAssetBlobId,
+            blobObjectId: record.sourceAssetBlobObjectId,
+          }
+        : null),
+  });
 
   const initialShooterStats = normalizeShooterStats(manifest.game?.stats);
   if (sql) {
@@ -1185,31 +1422,41 @@ app.post("/avatar/manifest", async (request, reply) => {
           updated_at = excluded.updated_at
     `;
 
-    await sql`
-      insert into walrus_asset_expiry (blob_object_id, blob_id, wallet_address, updated_at)
-      values (${record.avatarBlobObjectId}, ${record.avatarBlobId}, ${session.walletAddress}, now())
-      on conflict (blob_object_id) do update
-      set blob_id = excluded.blob_id,
-          wallet_address = excluded.wallet_address,
-          updated_at = excluded.updated_at
-    `;
+    for (const asset of [
+      walrusStorage?.runtimeAvatar,
+      walrusStorage?.preview,
+      walrusStorage?.manifest,
+      walrusStorage?.sourceAsset ?? null,
+    ]) {
+      if (!asset) {
+        continue;
+      }
 
-    await sql`
-      insert into walrus_asset_expiry (blob_object_id, blob_id, wallet_address, updated_at)
-      values (${record.previewBlobObjectId}, ${record.previewBlobId}, ${session.walletAddress}, now())
-      on conflict (blob_object_id) do update
-      set blob_id = excluded.blob_id,
-          wallet_address = excluded.wallet_address,
-          updated_at = excluded.updated_at
-    `;
-
-    if (record.sourceAssetBlobId && record.sourceAssetBlobObjectId) {
       await sql`
-        insert into walrus_asset_expiry (blob_object_id, blob_id, wallet_address, updated_at)
-        values (${record.sourceAssetBlobObjectId}, ${record.sourceAssetBlobId}, ${session.walletAddress}, now())
+        insert into walrus_asset_expiry (
+          blob_object_id,
+          blob_id,
+          wallet_address,
+          start_epoch,
+          end_epoch,
+          deletable,
+          updated_at
+        )
+        values (
+          ${asset.blobObjectId},
+          ${asset.blobId},
+          ${session.walletAddress},
+          ${asset.startEpoch ?? null},
+          ${asset.endEpoch ?? null},
+          ${asset.deletable ?? null},
+          now()
+        )
         on conflict (blob_object_id) do update
         set blob_id = excluded.blob_id,
             wallet_address = excluded.wallet_address,
+            start_epoch = excluded.start_epoch,
+            end_epoch = excluded.end_epoch,
+            deletable = excluded.deletable,
             updated_at = excluded.updated_at
       `;
     }
@@ -1251,6 +1498,7 @@ app.post("/avatar/manifest", async (request, reply) => {
       transactionDigest: record.transactionDigest ?? null,
       manifestJson: manifest,
       epochs: record.epochs,
+      walrusStorage,
       validationStatus,
       validationErrors: avatarValidationErrors,
       runtimeReady: record.runtimeReady,
@@ -1273,6 +1521,107 @@ app.post("/avatar/manifest", async (request, reply) => {
         errors: avatarValidationErrors,
       },
     shooterStats: initialShooterStats,
+    walrusStorage,
+  };
+});
+
+app.post("/avatar/storage/sync", async (request, reply) => {
+  const session = await requireWalletSession(sql, request, reply);
+  if (!session) {
+    return;
+  }
+
+  const body = z
+    .object({
+      avatarObjectId: z.string().startsWith("0x"),
+      walrusStorage: walrusAvatarStorageSchema,
+    })
+    .parse(request.body);
+
+  const ownershipVerified = await verifyAvatarOwnership(
+    session.walletAddress,
+    body.avatarObjectId,
+  );
+  if (!ownershipVerified) {
+    return reply.code(403).send({
+      error: "Avatar object is not currently owned by the authenticated wallet on Sui.",
+    });
+  }
+
+  const walrusStorage = summarizeWalrusAvatarStorage(body.walrusStorage);
+  if (!walrusStorage) {
+    return reply.code(400).send({ error: "Walrus storage payload is empty." });
+  }
+
+  const assets = [
+    walrusStorage.runtimeAvatar,
+    walrusStorage.preview,
+    walrusStorage.manifest,
+    walrusStorage.sourceAsset ?? null,
+  ].filter((asset): asset is WalrusBlobStorage => Boolean(asset));
+
+  if (sql) {
+    for (const asset of assets) {
+      await sql`
+        insert into walrus_asset_expiry (
+          blob_object_id,
+          blob_id,
+          wallet_address,
+          start_epoch,
+          end_epoch,
+          deletable,
+          updated_at
+        )
+        values (
+          ${asset.blobObjectId},
+          ${asset.blobId},
+          ${session.walletAddress},
+          ${asset.startEpoch ?? null},
+          ${asset.endEpoch ?? null},
+          ${asset.deletable ?? null},
+          now()
+        )
+        on conflict (blob_object_id) do update
+        set blob_id = excluded.blob_id,
+            wallet_address = excluded.wallet_address,
+            start_epoch = excluded.start_epoch,
+            end_epoch = excluded.end_epoch,
+            deletable = excluded.deletable,
+            updated_at = excluded.updated_at
+      `;
+    }
+
+    await sql`
+      update avatar_manifests
+      set updated_at = now()
+      where avatar_object_id = ${body.avatarObjectId}
+    `;
+  } else {
+    const existing = await getLocalManifestByAvatarObjectId(body.avatarObjectId);
+    if (existing) {
+      await upsertLocalManifestRecord({
+        manifestBlobId: existing.manifestBlobId,
+        walletAddress: existing.walletAddress,
+        avatarBlobId: existing.avatarBlobId,
+        avatarBlobObjectId: existing.avatarBlobObjectId,
+        previewBlobId: existing.previewBlobId,
+        previewBlobObjectId: existing.previewBlobObjectId,
+        manifestBlobObjectId: existing.manifestBlobObjectId,
+        avatarObjectId: existing.avatarObjectId,
+        transactionDigest: existing.transactionDigest,
+        manifestJson: existing.manifestJson,
+        epochs: existing.epochs,
+        walrusStorage,
+        validationStatus: existing.validationStatus,
+        validationErrors: existing.validationErrors,
+        runtimeReady: existing.runtimeReady,
+      });
+    }
+  }
+
+  return {
+    status: "synced",
+    walrusStorage,
   };
 });
 

@@ -4,38 +4,52 @@ import { useCurrentAccount, useCurrentClient, useDAppKit } from "@mysten/dapp-ki
 import { ConnectButton } from "@mysten/dapp-kit-react/ui";
 import {
   READY_AVATAR_DEFAULT_EPOCHS,
+  READY_AVATAR_MAX_EPOCHS,
   READY_AVATAR_MANIFEST_MIME,
   READY_AVATAR_NETWORK,
+  READY_AVATAR_OBJECT_SCHEMA_VERSION,
   READY_AVATAR_PREVIEW_MIME,
   READY_AVATAR_SCHEMA,
   READY_AVATAR_TYPE,
-  type ShooterCharacter,
   type ManifestRecord,
   type ReadyAvatarManifest,
+  type ShooterCharacter,
+  type WalrusAvatarStorage,
 } from "@pacific/shared";
+import { SiteTabs, type SiteRoute } from "./components/SiteTabs";
 import { webEnv, webEnvLimits } from "./env";
 import {
-  ensureWalletSession,
-  isApiAvailable,
-  type WalletSession,
-} from "./lib/session";
-import {
+  extendAvatarWalrusStorage,
   findOwnedAvatarObjectId,
   mintAvatarObject,
   persistManifestRecord,
+  syncWalrusStorageRecord,
 } from "./lib/avatar-chain";
+import {
+  fetchOwnedAvatarsFromBackend,
+  type BackendOwnedAvatar,
+} from "./lib/backend-avatar";
 import { persistLastPublishedAvatar } from "./lib/published-avatar";
 import {
-  SHOOTER_CHARACTER_PRESETS,
   createShooterPresetPreviewBlob,
   findShooterPresetById,
+  SHOOTER_CHARACTER_PRESETS,
   type ShooterCharacterPreset,
 } from "./lib/shooter-character-presets";
-import { SiteTabs } from "./components/SiteTabs";
+import { ensureWalletSession, isApiAvailable, type WalletSession } from "./lib/session";
+import {
+  describeWalrusRetention,
+  fetchWalrusNetworkClock,
+  summarizeWalrusStorage,
+  type WalrusNetworkClock,
+} from "./lib/walrus-storage";
 
 type UploadResult = {
   blobId: string;
   blobObjectId: string;
+  startEpoch: number | null;
+  endEpoch: number | null;
+  deletable: boolean | null;
 };
 
 type UploadedAsset = UploadResult & {
@@ -44,7 +58,7 @@ type UploadedAsset = UploadResult & {
   size: number;
 };
 
-type WorkflowPhase =
+type MintStatus =
   | "idle"
   | "verifying wallet session"
   | "uploading source asset blob"
@@ -55,6 +69,15 @@ type WorkflowPhase =
   | "publishing avatar object"
   | "success"
   | "error";
+
+type Phase =
+  | "home"
+  | "mint"
+  | "choose-operator"
+  | "identity"
+  | "mint-operator"
+  | "extend-operator"
+  | "minted";
 
 type GameMode = "shooter";
 type WalletSessionState = "idle" | "verifying" | "ready" | "error";
@@ -85,6 +108,18 @@ type MintReadinessItem = {
   detail: string;
 };
 
+type ExtendOperatorCard = {
+  objectId: string;
+  name: string;
+  role: string;
+  prefabResource: string;
+  previewUrl: string;
+  walrusStorage: WalrusAvatarStorage | null;
+  updatedAt: string | null;
+};
+
+const MINT_PHASE_ORDER: Phase[] = ["choose-operator", "identity", "mint-operator", "minted"];
+
 function formatError(error: unknown) {
   if (error instanceof Error && error.message) {
     return error.message;
@@ -101,8 +136,8 @@ function hasConfiguredAvatarPackageId(packageId: string) {
   return /^0x[0-9a-fA-F]+$/.test(packageId) && !/^0x0+$/.test(packageId);
 }
 
-function createWalrusUrl(blobId: string) {
-  return `walrus://${blobId}`;
+function createAssetUrl(blobId: string) {
+  return `${webEnv.apiBaseUrl}/asset/${encodeURIComponent(blobId)}`;
 }
 
 function formatLimitMb(limitMb: number) {
@@ -111,14 +146,6 @@ function formatLimitMb(limitMb: number) {
 
 function formatFileMeta(file: File) {
   return `${file.name} (${(file.size / (1024 * 1024)).toFixed(1)} MB)`;
-}
-
-function formatBytes(value: number | null) {
-  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
-    return "n/a";
-  }
-
-  return `${(value / (1024 * 1024)).toFixed(1)} MB`;
 }
 
 function formatIsoDate(value: string | null | undefined) {
@@ -132,6 +159,18 @@ function formatIsoDate(value: string | null | undefined) {
   }
 
   return parsed.toLocaleString();
+}
+
+function formatWalletAddress(value: string | null) {
+  if (!value) {
+    return "Wallet not connected";
+  }
+
+  return `${value.slice(0, 6)}...${value.slice(-4)}`;
+}
+
+function buildPhasePreview(preset: ShooterCharacterPreset | null, previewUrl: string | null) {
+  return previewUrl ?? preset?.previewImagePath ?? "/marketing/mint-preview.png";
 }
 
 const shooterInitialStats = {
@@ -192,14 +231,35 @@ function buildRuntimeUploadInput(
   };
 }
 
+function deriveExtendCardFromBackend(avatar: BackendOwnedAvatar): ExtendOperatorCard | null {
+  const previewBlobId = avatar.walrusStorage?.preview?.blobId;
+  const shooterCharacter = avatar.shooterCharacter;
+  if (!previewBlobId || !shooterCharacter) {
+    return null;
+  }
+
+  return {
+    objectId: avatar.objectId,
+    name: avatar.name ?? shooterCharacter.label,
+    role: shooterCharacter.role ?? "Shooter",
+    prefabResource: shooterCharacter.prefabResource,
+    previewUrl: `${webEnv.apiBaseUrl}/asset/${encodeURIComponent(previewBlobId)}`,
+    walrusStorage: avatar.walrusStorage,
+    updatedAt: avatar.updatedAt,
+  };
+}
+
 function App() {
   const account = useCurrentAccount();
   const client = useCurrentClient();
   const dAppKit = useDAppKit();
   const [session, setSession] = useState<WalletSession | null>(null);
-  const [name, setName] = useState("MFPS Shooter Avatar");
+  const [phase, setPhase] = useState<Phase>(() =>
+    window.location.pathname === "/create" ? "mint" : "home",
+  );
+  const [name, setName] = useState(SHOOTER_CHARACTER_PRESETS[0]?.label ?? "MFPS Shooter Avatar");
   const [description, setDescription] = useState(
-    "Pacific shooter NFT that launches into MFPS multiplayer.",
+    "Wallet-owned operator for the Pacific shooter runtime.",
   );
   const [sourceAssetFile, setSourceAssetFile] = useState<File | null>(null);
   const [sourceAssetError, setSourceAssetError] = useState<string | null>(null);
@@ -209,23 +269,28 @@ function App() {
   );
   const [previewBlob, setPreviewBlob] = useState<Blob | null>(null);
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
-  const [activeManifestBlobId, setActiveManifestBlobId] = useState<string | null>(null);
-  const [activeStatus, setActiveStatus] = useState("not-found");
   const [apiAvailable, setApiAvailable] = useState<boolean | null>(null);
   const [apiNotice, setApiNotice] = useState<string | null>(null);
   const [walletSessionState, setWalletSessionState] = useState<WalletSessionState>("idle");
   const [walletSessionError, setWalletSessionError] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busyLabel, setBusyLabel] = useState<string | null>(null);
-  const [workflowPhase, setWorkflowPhase] = useState<WorkflowPhase>("idle");
-  const [workflowDetail, setWorkflowDetail] = useState(
-    "Step 1: pick Shooter. Step 2: pick an MFPS character. Step 3: mint and launch.",
+  const [mintStatus, setMintStatus] = useState<MintStatus>("idle");
+  const [mintDetail, setMintDetail] = useState(
+    "Choose an operator, set the identity, finish every signature, then mint.",
   );
   const [publishState, setPublishState] = useState<PublishState | null>(null);
+  const [walrusClock, setWalrusClock] = useState<WalrusNetworkClock | null>(null);
+  const [renewBusyLabel, setRenewBusyLabel] = useState<string | null>(null);
+  const [renewNotice, setRenewNotice] = useState<string | null>(null);
+  const [renewError, setRenewError] = useState<string | null>(null);
   const [selectedGameMode, setSelectedGameMode] = useState<GameMode | null>(() => {
     const mode = new URLSearchParams(window.location.search).get("mode");
     return mode === "shooter" ? "shooter" : null;
   });
+  const [extendOperators, setExtendOperators] = useState<ExtendOperatorCard[]>([]);
+  const [extendLoading, setExtendLoading] = useState(false);
+  const [selectedExtendObjectId, setSelectedExtendObjectId] = useState<string | null>(null);
 
   const walletAddress = account?.address ?? null;
   const signer = useMemo(
@@ -241,6 +306,8 @@ function App() {
     () => findShooterPresetById(selectedShooterPresetId),
     [selectedShooterPresetId],
   );
+  const selectedPreviewArt = buildPhasePreview(selectedShooterPreset, previewUrl);
+
   const runtimeUploadPlan = useMemo(
     () =>
       characterAssetFile
@@ -260,6 +327,7 @@ function App() {
           : null,
     [characterAssetFile, selectedShooterPreset],
   );
+
   const mintReadiness = useMemo<MintReadinessItem[]>(
     () => [
       {
@@ -272,23 +340,32 @@ function App() {
         id: "mode",
         label: "Shooter mode selected",
         ready: shooterSelected,
-        detail: shooterSelected ? "Shooter mode ready." : "Choose Shooter mode.",
+        detail: shooterSelected ? "Shooter path locked." : "Choose the shooter path.",
       },
       {
         id: "character",
-        label: "MFPS character selected",
+        label: "MFPS operator selected",
         ready: Boolean(selectedShooterPreset),
         detail: selectedShooterPreset
           ? `${selectedShooterPreset.label} (${selectedShooterPreset.prefabResource}) selected.`
           : "Select an MFPS character preset.",
       },
       {
+        id: "identity",
+        label: "Operator identity set",
+        ready: name.trim().length > 0 && description.trim().length > 0,
+        detail:
+          name.trim().length > 0 && description.trim().length > 0
+            ? "Name and description are ready."
+            : "Add a name and short description.",
+      },
+      {
         id: "preview",
-        label: "Mint preview generated",
+        label: "Preview generated",
         ready: Boolean(previewBlob && previewUrl),
         detail:
           previewBlob && previewUrl
-            ? "Preview image ready for manifest."
+            ? "Preview image ready."
             : "Waiting for preview generation.",
       },
       {
@@ -309,6 +386,8 @@ function App() {
       },
     ],
     [
+      description,
+      name,
       packageConfigured,
       previewBlob,
       previewUrl,
@@ -318,51 +397,46 @@ function App() {
       walletAddress,
     ],
   );
+
   const mintBlockingReasons = useMemo(
     () => mintReadiness.filter((item) => !item.ready).map((item) => item.detail),
     [mintReadiness],
   );
   const publishReady = mintBlockingReasons.length === 0;
   const readinessCount = mintReadiness.filter((item) => item.ready).length;
-  const selectedOperatorLabel = selectedShooterPreset
-    ? `${selectedShooterPreset.label} / ${selectedShooterPreset.prefabResource}`
-    : "No operator selected";
-  const heroPreviewImage =
-    previewUrl ?? selectedShooterPreset?.previewImagePath ?? "/marketing/runtime-hub.png";
-  const walletSessionSummary =
+  const estimatedWalletPromptCount =
+    3 + (sourceAssetFile ? 1 : 0) + 1 + (apiAvailable === false ? 0 : 1);
+  const walrusEpochPlan = webEnv.walrusEpochs || READY_AVATAR_DEFAULT_EPOCHS;
+  const mintedWalrusRetention = describeWalrusRetention(
+    publishState?.manifestRecord.walrusStorage ?? null,
+    walrusClock,
+  );
+  const activeRoute: SiteRoute = phase === "home" ? "start" : "create";
+  const walletStatusLabel =
     walletSessionState === "ready"
       ? `Verified until ${formatIsoDate(session?.expiresAt)}`
       : walletSessionState === "verifying"
-        ? "Waiting for wallet signature approval."
+        ? "Waiting for wallet signature."
         : apiAvailable === false
-          ? "API offline. Mint can continue, but backend sync will wait."
+          ? "Mint works, but online sync is offline."
           : walletAddress
-            ? "Session will be requested before final mint sync."
-            : "Connect wallet to verify save-back session.";
-  const walrusWriteCount = 3 + (sourceAssetFile ? 1 : 0);
-  const estimatedWalletPromptCount =
-    walrusWriteCount + 1 + (apiAvailable === false ? 0 : 1);
-  const signatureChecklist = [
-    apiAvailable === false
-      ? "Backend session signature is skipped while the local API is offline."
-      : "Approve the wallet session signature so minting and save-back are tied to your wallet.",
-    `Approve ${walrusWriteCount} Walrus upload signature${
-      walrusWriteCount === 1 ? "" : "s"
-    } for runtime, preview, manifest${sourceAssetFile ? ", and source asset" : ""}.`,
-    "Approve the final Sui transaction signature that mints the Avatar object on-chain.",
-    "Do not close the tab, leave the page, or dismiss any remaining wallet prompt until the flow finishes.",
-  ];
-  const createStatusChips = [
-    walletAddress ? "Wallet armed" : "Wallet offline",
-    shooterSelected ? "Shooter pipeline" : "Mode pending",
-    walletSessionState === "ready" ? "Session verified" : "Session pending",
-    publishReady ? "Mint payload greenlit" : "Mint payload blocked",
-  ];
+            ? "Wallet session will be verified before save-back."
+            : "Connect wallet to begin.";
+  const selectedExtendOperator =
+    extendOperators.find((avatar) => avatar.objectId === selectedExtendObjectId) ?? null;
+  const currentMintStepIndex = MINT_PHASE_ORDER.indexOf(phase);
+  const phaseSteps = [
+    { key: "mint", label: "Mint Menu" },
+    { key: "choose-operator", label: "Choose Operator" },
+    { key: "identity", label: "Identity" },
+    { key: "mint-operator", label: "Mint Operator" },
+    { key: "minted", label: "Live" },
+  ] as const;
 
-  const updateWorkflow = useCallback(
-    (phase: WorkflowPhase, detail: string, nextBusyLabel: string | null = null) => {
-      setWorkflowPhase(phase);
-      setWorkflowDetail(detail);
+  const updateMintStatus = useCallback(
+    (nextStatus: MintStatus, detail: string, nextBusyLabel: string | null = null) => {
+      setMintStatus(nextStatus);
+      setMintDetail(detail);
       setBusyLabel(nextBusyLabel);
     },
     [],
@@ -373,16 +447,65 @@ function App() {
     const nextUrl = new URL(window.location.href);
     nextUrl.searchParams.set("mode", "shooter");
     window.history.replaceState({}, "", `${nextUrl.pathname}${nextUrl.search}`);
-    updateWorkflow(
-      "idle",
-      "Shooter selected. Pick an MFPS character preset, mint, then launch multiplayer.",
-    );
-  }, [updateWorkflow]);
+    updateMintStatus("idle", "Shooter selected. Choose an operator and continue.");
+  }, [updateMintStatus]);
+
+  useEffect(() => {
+    const nextPath = phase === "home" ? "/" : "/create";
+    if (window.location.pathname !== nextPath) {
+      const nextUrl = new URL(window.location.href);
+      nextUrl.pathname = nextPath;
+      window.history.replaceState({}, "", `${nextUrl.pathname}${nextUrl.search}`);
+    }
+  }, [phase]);
+
+  useEffect(() => {
+    if (phase !== "home" && !shooterSelected) {
+      chooseShooterMode();
+    }
+  }, [chooseShooterMode, phase, shooterSelected]);
+
+  const nextPhase = useCallback(() => {
+    setPhase((current) => {
+      switch (current) {
+        case "mint":
+          return "choose-operator";
+        case "choose-operator":
+          return "identity";
+        case "identity":
+          return "mint-operator";
+        default:
+          return current;
+      }
+    });
+  }, []);
+
+  const previousPhase = useCallback(() => {
+    setPhase((current) => {
+      switch (current) {
+        case "mint":
+          return "home";
+        case "choose-operator":
+          return "mint";
+        case "identity":
+          return "choose-operator";
+        case "mint-operator":
+          return "identity";
+        case "extend-operator":
+          return "mint";
+        case "minted":
+          return "mint";
+        default:
+          return current;
+      }
+    });
+  }, []);
 
   const buildShooterLaunchHref = useCallback(
     (avatarObjectId?: string | null, manifestBlobId?: string | null) => {
-      const url = new URL("/unity", window.location.origin);
+      const url = new URL("/world", window.location.origin);
       url.searchParams.set("mode", "shooter");
+      url.searchParams.set("fullscreen", "1");
       if (avatarObjectId) {
         url.searchParams.set("avatarObjectId", avatarObjectId);
       }
@@ -400,52 +523,33 @@ function App() {
     setApiNotice(
       available
         ? null
-        : `Local API not detected at ${webEnv.apiBaseUrl}. Publish will continue without backend session, manifest caching, or active-avatar lookup.`,
+        : `Local API not detected at ${webEnv.apiBaseUrl}. Mint continues, but backend sync waits until the API is back.`,
     );
     return available;
   }, []);
-
-  const refreshActiveAvatar = useCallback(async () => {
-    if (!walletAddress) {
-      setActiveManifestBlobId(null);
-      setActiveStatus("not-found");
-      return;
-    }
-
-    const available = apiAvailable ?? (await probeApiAvailability());
-    if (!available) {
-      return;
-    }
-
-    try {
-      const response = await fetch(
-        `${webEnv.apiBaseUrl}/avatar/${encodeURIComponent(walletAddress)}`,
-      );
-      if (!response.ok) {
-        return;
-      }
-
-      const data = (await response.json()) as {
-        manifestBlobId: string | null;
-        status: string;
-      };
-      setActiveManifestBlobId(data.manifestBlobId);
-      setActiveStatus(data.status);
-      setApiAvailable(true);
-      setApiNotice(null);
-    } catch (caught) {
-      setApiAvailable(false);
-      setApiNotice(`Active-avatar lookup is unavailable: ${formatError(caught)}`);
-    }
-  }, [apiAvailable, probeApiAvailability, walletAddress]);
 
   useEffect(() => {
     void probeApiAvailability();
   }, [probeApiAvailability]);
 
   useEffect(() => {
-    void refreshActiveAvatar();
-  }, [refreshActiveAvatar]);
+    let cancelled = false;
+
+    (async () => {
+      try {
+        const nextClock = await fetchWalrusNetworkClock(client);
+        if (!cancelled) {
+          setWalrusClock(nextClock);
+        }
+      } catch (caught) {
+        console.warn("Failed to load Walrus epoch clock.", caught);
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [client]);
 
   useEffect(() => {
     let cancelled = false;
@@ -492,7 +596,7 @@ function App() {
     return () => {
       cancelled = true;
     };
-  }, [apiAvailable, dAppKit, walletAddress]);
+  }, [apiAvailable, dAppKit, session, walletAddress]);
 
   useEffect(() => {
     return () => {
@@ -504,6 +608,7 @@ function App() {
 
   useEffect(() => {
     let disposed = false;
+
     if (!shooterSelected || !selectedShooterPreset) {
       return () => {
         disposed = true;
@@ -573,6 +678,111 @@ function App() {
     [ensureSession],
   );
 
+  useEffect(() => {
+    let cancelled = false;
+
+    if (phase !== "extend-operator") {
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    if (!walletAddress) {
+      setExtendOperators(
+        publishState
+          ? [
+              {
+                objectId: publishState.avatarObjectId,
+                name: publishState.shooterCharacter.label,
+                role: publishState.shooterCharacter.role ?? "Shooter",
+                prefabResource: publishState.shooterCharacter.prefabResource,
+                previewUrl: selectedPreviewArt,
+                walrusStorage: publishState.manifestRecord.walrusStorage ?? null,
+                updatedAt: new Date().toISOString(),
+              },
+            ]
+          : [],
+      );
+      setSelectedExtendObjectId(publishState?.avatarObjectId ?? null);
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    (async () => {
+      setExtendLoading(true);
+      try {
+        const result = await fetchOwnedAvatarsFromBackend(walletAddress, webEnv.avatarPackageId);
+        if (cancelled) {
+          return;
+        }
+
+        const backendCards = result.avatars
+          .map((avatar) => deriveExtendCardFromBackend(avatar))
+          .filter((avatar): avatar is ExtendOperatorCard => Boolean(avatar));
+
+        const publishedCard =
+          publishState?.manifestRecord.walrusStorage && selectedShooterPreset
+            ? {
+                objectId: publishState.avatarObjectId,
+                name: publishState.shooterCharacter.label,
+                role: publishState.shooterCharacter.role ?? "Shooter",
+                prefabResource: publishState.shooterCharacter.prefabResource,
+                previewUrl: selectedPreviewArt,
+                walrusStorage: publishState.manifestRecord.walrusStorage ?? null,
+                updatedAt: new Date().toISOString(),
+              }
+            : null;
+
+        const merged = publishedCard
+          ? [
+              publishedCard,
+              ...backendCards.filter((card) => card.objectId !== publishedCard.objectId),
+            ]
+          : backendCards;
+
+        setExtendOperators(merged);
+        setSelectedExtendObjectId((current) => current ?? merged[0]?.objectId ?? null);
+      } catch (caught) {
+        if (cancelled) {
+          return;
+        }
+
+        if (publishState?.manifestRecord.walrusStorage && selectedShooterPreset) {
+          setExtendOperators([
+            {
+              objectId: publishState.avatarObjectId,
+              name: publishState.shooterCharacter.label,
+              role: publishState.shooterCharacter.role ?? "Shooter",
+              prefabResource: publishState.shooterCharacter.prefabResource,
+              previewUrl: selectedPreviewArt,
+              walrusStorage: publishState.manifestRecord.walrusStorage ?? null,
+              updatedAt: new Date().toISOString(),
+            },
+          ]);
+          setSelectedExtendObjectId(publishState.avatarObjectId);
+        } else {
+          setExtendOperators([]);
+        }
+        setApiNotice(`Extend lookup limited: ${formatError(caught)}`);
+      } finally {
+        if (!cancelled) {
+          setExtendLoading(false);
+        }
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    phase,
+    publishState,
+    selectedPreviewArt,
+    selectedShooterPreset,
+    walletAddress,
+  ]);
+
   const handleSourceAssetChange = useCallback((file: File | null) => {
     setPublishState(null);
     setSourceAssetError(null);
@@ -600,12 +810,7 @@ function App() {
       setError(null);
 
       if (!file) {
-        updateWorkflow(
-          "idle",
-          shooterSelected
-            ? "Shooter selected. Pick a character preset and mint."
-            : "Step 1: pick Shooter. Step 2: choose an MFPS character and mint.",
-        );
+        updateMintStatus("idle", "Using the selected preset runtime payload.");
         return;
       }
 
@@ -613,16 +818,16 @@ function App() {
         const message = `Character asset exceeds the ${formatLimitMb(webEnv.maxRuntimeAvatarMb)} limit.`;
         setCharacterAssetFile(null);
         setError(message);
-        updateWorkflow("error", message);
+        updateMintStatus("error", message);
         return;
       }
 
-      updateWorkflow(
+      updateMintStatus(
         "preview loaded",
-        `Attached shooter character override file: ${formatFileMeta(file)}. VRM uploads can take several minutes, so keep the tab open until mint completes.`,
+        `Attached runtime override: ${formatFileMeta(file)}. VRM uploads can take several minutes, so keep the tab open until mint completes.`,
       );
     },
-    [shooterSelected, updateWorkflow],
+    [updateMintStatus],
   );
 
   const uploadWalrusBlob = useCallback(
@@ -636,7 +841,7 @@ function App() {
 
       const result = await client.walrus.writeBlob({
         blob: bytes,
-        deletable: true,
+        deletable: false,
         epochs: webEnv.walrusEpochs || READY_AVATAR_DEFAULT_EPOCHS,
         signer,
         owner: walletAddress,
@@ -649,6 +854,9 @@ function App() {
       return {
         blobId: result.blobId,
         blobObjectId: result.blobObject.id,
+        startEpoch: result.blobObject.storage.start_epoch,
+        endEpoch: result.blobObject.storage.end_epoch,
+        deletable: result.blobObject.deletable,
       };
     },
     [client.walrus, signer, walletAddress],
@@ -656,42 +864,44 @@ function App() {
 
   const handlePublish = useCallback(async () => {
     setError(null);
+    setRenewNotice(null);
+    setRenewError(null);
 
     if (!shooterSelected) {
-      const message = "Pick Shooter first, then mint.";
+      const message = "Choose the shooter flow first.";
       setError(message);
-      updateWorkflow("error", message);
+      updateMintStatus("error", message);
       return;
     }
 
     if (mintBlockingReasons.length > 0) {
       const message = `Mint blocked: ${mintBlockingReasons.join(" ")}`;
       setError(message);
-      updateWorkflow("error", message);
+      updateMintStatus("error", message);
       return;
     }
 
     if (!walletAddress || !selectedShooterPreset || !previewBlob || !previewUrl) {
       const message = "Mint requirements changed during validation. Reload and try again.";
       setError(message);
-      updateWorkflow("error", message);
+      updateMintStatus("error", message);
       return;
     }
 
     if (!packageConfigured) {
       const message =
-        "Set VITE_AVATAR_PACKAGE_ID to the published Avatar Move package before publishing. The app is still using the placeholder value 0x0.";
+        "Set VITE_AVATAR_PACKAGE_ID to the published Avatar Move package before minting.";
       setError(message);
-      updateWorkflow("error", message);
+      updateMintStatus("error", message);
       return;
     }
 
     try {
       const available = await probeApiAvailability();
       if (available) {
-        updateWorkflow(
+        updateMintStatus(
           "verifying wallet session",
-          "Approve the wallet verification signature first. This links the mint pipeline and post-match save-back to your current wallet.",
+          "Approve the wallet verification signature first. This links minting and save-back to your wallet.",
           "Waiting for wallet signature",
         );
         const nextSession = await ensureSession();
@@ -702,10 +912,10 @@ function App() {
 
       const sourceAssetUpload = sourceAssetFile
         ? await (async () => {
-            updateWorkflow(
+            updateMintStatus(
               "uploading source asset blob",
-              "Approve the Walrus upload signature for the archival source asset. Large VRM/source files can take several minutes. Do not close or leave.",
-              "Awaiting source asset approval",
+              "Approve the Walrus upload for the optional source asset. Large VRM and archive files can take several minutes. Do not close or leave.",
+              "Uploading source asset",
             );
             return uploadWalrusBlob(
               sourceAssetFile,
@@ -721,10 +931,10 @@ function App() {
         characterAssetFile,
       );
 
-      updateWorkflow(
+      updateMintStatus(
         "uploading runtime character blob",
-        "Approve the Walrus upload signature for the runtime character payload. If this is a VRM, keep the page open until the upload finalizes.",
-        "Awaiting runtime upload approval",
+        "Approve the Walrus upload for the runtime payload. VRM uploads can take several minutes. Do not close or leave.",
+        "Uploading runtime payload",
       );
       const runtimeUpload = await uploadWalrusBlob(
         runtimeUploadInput.body,
@@ -732,10 +942,10 @@ function App() {
         runtimeUploadInput.mime,
       );
 
-      updateWorkflow(
+      updateMintStatus(
         "uploading preview blob",
-        "Approve the Walrus upload signature for the preview image.",
-        "Awaiting preview approval",
+        "Approve the Walrus upload for the preview image.",
+        "Uploading preview",
       );
       const previewUpload = await uploadWalrusBlob(
         previewBlob,
@@ -753,11 +963,12 @@ function App() {
         runtimeAssetFilename: runtimeUploadInput.filename,
       };
 
+      const manifestDescription = description.trim() || selectedShooterPreset.tagline;
       const manifest: ReadyAvatarManifest = {
         schema: READY_AVATAR_SCHEMA,
         type: READY_AVATAR_TYPE,
         name,
-        description: description.trim() || undefined,
+        description: manifestDescription,
         owner: walletAddress,
         network: READY_AVATAR_NETWORK,
         sourceAsset: sourceAssetUpload
@@ -796,10 +1007,10 @@ function App() {
         },
       };
 
-      updateWorkflow(
+      updateMintStatus(
         "uploading manifest blob",
-        "Approve the Walrus upload signature for the manifest. This binds the NFT to the operator, stats seed, and runtime metadata.",
-        "Awaiting manifest approval",
+        "Approve the Walrus upload for the manifest. This binds the NFT to the operator, stats seed, and runtime metadata.",
+        "Uploading manifest",
       );
       const manifestBuffer = new TextEncoder().encode(JSON.stringify(manifest, null, 2));
       const manifestUpload = await uploadWalrusBlob(
@@ -808,18 +1019,26 @@ function App() {
         READY_AVATAR_MANIFEST_MIME,
       );
 
-      updateWorkflow(
+      updateMintStatus(
         "publishing avatar object",
-        "Approve the final Sui mint transaction. Do not close the wallet, switch tabs, or leave until the transaction confirms.",
-        "Awaiting on-chain mint signature",
+        "Approve the final Sui mint transaction. Do not close the wallet or leave until the transaction confirms.",
+        "Waiting for mint signature",
       );
-      const rigLabel = `${shooterRuntimeFormat}:${shooterCharacter.id}`;
+      const legacyRig = `${shooterRuntimeFormat}:${shooterCharacter.id}`;
       const mintResult = await mintAvatarObject(
+        client,
         dAppKit,
         walletAddress,
-        name,
-        rigLabel,
-        createWalrusUrl(manifestUpload.blobId),
+        {
+          name,
+          description: manifestDescription,
+          manifestBlobId: manifestUpload.blobId,
+          previewBlobId: previewUpload.blobId,
+          previewUrl: createAssetUrl(previewUpload.blobId),
+          projectUrl: webEnv.projectUrl,
+          schemaVersion: READY_AVATAR_OBJECT_SCHEMA_VERSION,
+          legacyRig,
+        },
       );
 
       const avatarObjectId =
@@ -832,6 +1051,14 @@ function App() {
       }
 
       const transactionDigest = mintResult.digest;
+      const walrusStorage = summarizeWalrusStorage({
+        runtimeAvatar: runtimeUpload,
+        preview: previewUpload,
+        manifest: manifestUpload,
+        sourceAsset: sourceAssetUpload,
+        minimumEndEpoch: null,
+        maximumEndEpoch: null,
+      }) as WalrusAvatarStorage;
 
       const manifestRecord: ManifestRecord = {
         avatarBlobId: runtimeUpload.blobId,
@@ -845,6 +1072,7 @@ function App() {
         avatarObjectId,
         transactionDigest,
         epochs: webEnv.walrusEpochs || READY_AVATAR_DEFAULT_EPOCHS,
+        walrusStorage,
         runtimeReady: true,
       };
 
@@ -894,16 +1122,8 @@ function App() {
         apiPersisted: false,
       });
 
-      setActiveManifestBlobId(manifestUpload.blobId);
-      setActiveStatus("playable");
-      updateWorkflow(
-        "success",
-        "Mint complete. Loading MFPS shooter runtime with your minted character profile...",
-      );
-
-      window.setTimeout(() => {
-        window.location.assign(buildShooterLaunchHref(avatarObjectId, manifestUpload.blobId));
-      }, 450);
+      updateMintStatus("success", "Mint complete. Your operator is live and ready to launch.");
+      setPhase("minted");
 
       void syncManifestRecord(manifest, manifestRecord).then((persisted) => {
         if (!persisted) {
@@ -915,447 +1135,599 @@ function App() {
             ? { ...current, apiPersisted: true }
             : current,
         );
-        void refreshActiveAvatar();
       });
     } catch (caught) {
       const message = formatError(caught);
       setError(message);
-      updateWorkflow("error", message);
+      updateMintStatus("error", message);
     }
   }, [
-    buildShooterLaunchHref,
     characterAssetFile,
     client,
     dAppKit,
     description,
+    ensureSession,
+    mintBlockingReasons,
     name,
     packageConfigured,
-    mintBlockingReasons,
     previewBlob,
     previewUrl,
-    refreshActiveAvatar,
+    probeApiAvailability,
     selectedShooterPreset,
     shooterSelected,
     sourceAssetFile,
     syncManifestRecord,
-    updateWorkflow,
+    updateMintStatus,
     uploadWalrusBlob,
     walletAddress,
   ]);
 
-  return (
-    <div className="app-shell app-shell--create">
-      <header className="topbar">
-        <div className="topbar-copy">
-          <p className="eyebrow">Pacific Strike Network</p>
-          <h1>Forge a wallet-owned operator and deploy it straight into MFPS.</h1>
-          <p className="lede">
-            This is a shooter command center now, not a crypto form. Connect your wallet, choose
-            the operator, finish every signature, mint on Sui + Walrus, and jump directly into the
-            verified runtime.
+  const handleRenewExtendOperator = useCallback(async () => {
+    if (!selectedExtendOperator?.walrusStorage) {
+      setRenewError("Select an extendable operator first.");
+      return;
+    }
+
+    setRenewBusyLabel("Renewing storage...");
+    setRenewNotice(null);
+    setRenewError(null);
+
+    try {
+      const renewed = await extendAvatarWalrusStorage({
+        client,
+        dAppKit,
+        walrusStorage: selectedExtendOperator.walrusStorage,
+        epochs: READY_AVATAR_MAX_EPOCHS,
+      });
+
+      let persisted = false;
+      if (walletAddress) {
+        try {
+          const currentSession = await ensureSession();
+          await syncWalrusStorageRecord(
+            currentSession,
+            selectedExtendOperator.objectId,
+            renewed.walrusStorage,
+          );
+          persisted = true;
+        } catch (caught) {
+          setApiNotice(`Walrus renewal synced locally only: ${formatError(caught)}`);
+        }
+      }
+
+      setExtendOperators((current) =>
+        current.map((operator) =>
+          operator.objectId === selectedExtendOperator.objectId
+            ? {
+                ...operator,
+                walrusStorage: renewed.walrusStorage,
+                updatedAt: new Date().toISOString(),
+              }
+            : operator,
+        ),
+      );
+
+      if (publishState && publishState.avatarObjectId === selectedExtendOperator.objectId) {
+        setPublishState((current) =>
+          current
+            ? {
+                ...current,
+                manifestRecord: {
+                  ...current.manifestRecord,
+                  walrusStorage: renewed.walrusStorage,
+                },
+                apiPersisted: current.apiPersisted || persisted,
+              }
+            : current,
+        );
+      }
+
+      const retention = describeWalrusRetention(renewed.walrusStorage, walrusClock);
+      setRenewNotice(
+        `Operator extended (${renewed.digest}). ${retention.detail}${persisted ? " Backend cache synced." : ""}`,
+      );
+    } catch (caught) {
+      setRenewError(formatError(caught));
+    } finally {
+      setRenewBusyLabel(null);
+    }
+  }, [client, dAppKit, ensureSession, publishState, selectedExtendOperator, walrusClock, walletAddress]);
+
+  const openPlay = useCallback(() => {
+    window.location.assign("/unity");
+  }, []);
+
+  const openMint = useCallback(() => {
+    setPhase("mint");
+    setRenewNotice(null);
+    setRenewError(null);
+  }, []);
+
+  const launchMintOperator = useCallback(() => {
+    setPhase("choose-operator");
+    setRenewNotice(null);
+    setRenewError(null);
+  }, []);
+
+  const launchExtendOperator = useCallback(() => {
+    setPhase("extend-operator");
+    setRenewNotice(null);
+    setRenewError(null);
+  }, []);
+
+  const launchPublishedOperator = useCallback(() => {
+    window.location.assign(
+      buildShooterLaunchHref(
+        publishState?.avatarObjectId ?? null,
+        publishState?.manifestBlob.blobId ?? null,
+      ),
+    );
+  }, [buildShooterLaunchHref, publishState?.avatarObjectId, publishState?.manifestBlob.blobId]);
+
+  const renderPhasePanel = () => {
+    if (phase === "home") {
+      return (
+        <section className="home-choice-grid">
+          <button className="phase-choice-card" onClick={openMint} type="button">
+            <div className="phase-choice-copy">
+              <p className="eyebrow">Option 01</p>
+              <h2>Mint</h2>
+              <p>Create a new wallet-owned operator in a guided flow.</p>
+            </div>
+            <img src="/marketing/mint-preview.png" alt="Mint operator flow" />
+          </button>
+          <button className="phase-choice-card" onClick={openPlay} type="button">
+            <div className="phase-choice-copy">
+              <p className="eyebrow">Option 02</p>
+              <h2>Play</h2>
+              <p>Load owned operators only and jump straight into the game.</p>
+            </div>
+            <img src="/marketing/runtime-hub.png" alt="Play flow" />
+          </button>
+        </section>
+      );
+    }
+
+    if (phase === "mint") {
+      return (
+        <section className="phase-card-grid">
+          <button className="phase-action-card" onClick={launchMintOperator} type="button">
+            <div className="phase-action-copy">
+              <p className="eyebrow">Mint flow</p>
+              <h2>Mint Operator</h2>
+              <p>Choose an operator, set the identity, and mint the NFT.</p>
+            </div>
+            <span className="phase-action-tag">3 phases</span>
+          </button>
+          <button className="phase-action-card" onClick={launchExtendOperator} type="button">
+            <div className="phase-action-copy">
+              <p className="eyebrow">Storage flow</p>
+              <h2>Extend Operator</h2>
+              <p>Renew Walrus storage for an operator you already own.</p>
+            </div>
+            <span className="phase-action-tag">1 phase</span>
+          </button>
+        </section>
+      );
+    }
+
+    if (phase === "choose-operator") {
+      return (
+        <section className="phase-screen">
+          <div className="phase-head">
+            <div>
+              <p className="eyebrow">Phase 1</p>
+              <h2>Choose operator</h2>
+            </div>
+            <span className="section-badge">{selectedShooterPreset?.role ?? "Preset"}</span>
+          </div>
+          <p className="section-copy">
+            Pick the exact MFPS class this NFT will control in game.
           </p>
-          <SiteTabs activeRoute="create" />
+          <div className="operator-grid">
+            {SHOOTER_CHARACTER_PRESETS.map((preset) => (
+              <button
+                className={`operator-card${preset.id === selectedShooterPresetId ? " active" : ""}`}
+                key={preset.id}
+                onClick={() => setSelectedShooterPresetId(preset.id)}
+                type="button"
+              >
+                <img src={preset.previewImagePath} alt={`${preset.label} preview`} />
+                <div className="operator-card-copy">
+                  <strong>{preset.label}</strong>
+                  <p>{preset.tagline}</p>
+                  <span>
+                    {preset.role} · {preset.prefabResource}
+                  </span>
+                </div>
+              </button>
+            ))}
+          </div>
+          <div className="action-row">
+            <button className="secondary-button" onClick={previousPhase} type="button">
+              Back
+            </button>
+            <button className="primary-button" onClick={nextPhase} type="button">
+              Continue
+            </button>
+          </div>
+        </section>
+      );
+    }
+
+    if (phase === "identity") {
+      return (
+        <section className="phase-screen">
+          <div className="phase-head">
+            <div>
+              <p className="eyebrow">Phase 2</p>
+              <h2>Name and description</h2>
+            </div>
+            <span className="section-badge">Identity</span>
+          </div>
+          <p className="section-copy">
+            Give the operator a name and a short story. Keep it tight.
+          </p>
+          <div className="form-stack">
+            <label className="form-field">
+              <span>Operator name</span>
+              <input
+                value={name}
+                onChange={(event) => setName(event.target.value)}
+                placeholder="MPlayer 1"
+              />
+            </label>
+            <label className="form-field">
+              <span>Description</span>
+              <input
+                value={description}
+                onChange={(event) => setDescription(event.target.value)}
+                placeholder="Balanced assault loadout for Pacific strike matches."
+              />
+            </label>
+          </div>
+          <details className="mini-details">
+            <summary>Optional files</summary>
+            <div className="detail-stack">
+              <label className="upload-field">
+                <span>Source asset</span>
+                <input
+                  type="file"
+                  accept=".vrm,.glb,.gltf,.fbx,.zip,.png,.jpg,.jpeg,.webp,.json,.txt"
+                  onChange={(event) => handleSourceAssetChange(event.target.files?.[0] ?? null)}
+                />
+                <p>Attach a provenance file only if you want it saved with the NFT.</p>
+                <small>
+                  Max {webEnv.maxSourceAssetMb} MB
+                  {sourceAssetFile ? ` · ${formatFileMeta(sourceAssetFile)}` : ""}
+                </small>
+              </label>
+              <label className="upload-field">
+                <span>Runtime override file</span>
+                <input
+                  type="file"
+                  accept=".vrm,.glb,.gltf,.fbx,.json,.bin,.bytes"
+                  onChange={(event) => handleCharacterAssetChange(event.target.files?.[0] ?? null)}
+                />
+                <p>Leave empty to use the built-in preset runtime payload.</p>
+                <small>
+                  Max {webEnv.maxRuntimeAvatarMb} MB. VRM uploads can take minutes. Do not close,
+                  refresh, or leave.
+                </small>
+              </label>
+            </div>
+          </details>
+          <div className="action-row">
+            <button className="secondary-button" onClick={previousPhase} type="button">
+              Back
+            </button>
+            <button
+              className="primary-button"
+              disabled={name.trim().length === 0 || description.trim().length === 0}
+              onClick={nextPhase}
+              type="button"
+            >
+              Continue
+            </button>
+          </div>
+        </section>
+      );
+    }
+
+    if (phase === "mint-operator") {
+      return (
+        <section className="phase-screen">
+          <div className="phase-head">
+            <div>
+              <p className="eyebrow">Phase 3</p>
+              <h2>Mint operator</h2>
+            </div>
+            <span className="section-badge">
+              {readinessCount}/{mintReadiness.length} ready
+            </span>
+          </div>
+          <p className="section-copy">{mintDetail}</p>
+          <div className="summary-grid">
+            <div className="summary-item">
+              <span>Wallet</span>
+              <strong>{formatWalletAddress(walletAddress)}</strong>
+            </div>
+            <div className="summary-item">
+              <span>Operator</span>
+              <strong>{selectedShooterPreset?.label ?? "Pending"}</strong>
+            </div>
+            <div className="summary-item">
+              <span>Prefab</span>
+              <strong>{selectedShooterPreset?.prefabResource ?? "Pending"}</strong>
+            </div>
+            <div className="summary-item">
+              <span>Status</span>
+              <strong>{walletStatusLabel}</strong>
+            </div>
+          </div>
+          {!publishReady ? (
+            <ul className="check-list">
+              {mintBlockingReasons.map((reason) => (
+                <li key={reason}>{reason}</li>
+              ))}
+            </ul>
+          ) : (
+            <div className="success-strip">
+              <strong>Ready to mint</strong>
+              <span>{estimatedWalletPromptCount} wallet prompts expected.</span>
+            </div>
+          )}
+          <details className="mini-details">
+            <summary>Important before minting</summary>
+            <div className="detail-stack">
+              <ul className="check-list check-list--muted">
+                <li>Finish every wallet prompt until minting is fully complete.</li>
+                <li>VRM and large runtime uploads can take minutes.</li>
+                <li>Do not close, refresh, or leave during upload or mint.</li>
+                <li>
+                  Character files are stored on Walrus for {walrusEpochPlan} epochs and can be
+                  renewed later.
+                </li>
+              </ul>
+            </div>
+          </details>
+          <div className="action-row">
+            <button className="secondary-button" onClick={previousPhase} type="button">
+              Back
+            </button>
+            <button
+              className="primary-button primary-button--wide"
+              disabled={Boolean(busyLabel) || !publishReady || !walletAddress}
+              onClick={() => void handlePublish()}
+              type="button"
+            >
+              {busyLabel ?? "Mint Operator"}
+            </button>
+          </div>
+        </section>
+      );
+    }
+
+    if (phase === "minted") {
+      return (
+        <section className="phase-screen">
+          <div className="phase-head">
+            <div>
+              <p className="eyebrow">Live</p>
+              <h2>Operator ready</h2>
+            </div>
+            <span className="section-badge">{mintedWalrusRetention.shortLabel}</span>
+          </div>
+          <p className="section-copy">
+            Your NFT is live on Sui, the files are live on Walrus, and you can launch or extend
+            from here.
+          </p>
+          {publishState ? (
+            <div className="summary-grid">
+              <div className="summary-item">
+                <span>Operator</span>
+                <strong>{publishState.shooterCharacter.label}</strong>
+              </div>
+              <div className="summary-item">
+                <span>Storage</span>
+                <strong>{mintedWalrusRetention.protectionLabel}</strong>
+              </div>
+              <div className="summary-item">
+                <span>Save sync</span>
+                <strong>{publishState.apiPersisted ? "Online" : "Local only"}</strong>
+              </div>
+              <div className="summary-item">
+                <span>Mint status</span>
+                <strong>{mintStatus}</strong>
+              </div>
+            </div>
+          ) : null}
+          <div className="action-row">
+            <button className="primary-button" onClick={launchPublishedOperator} type="button">
+              Launch Game
+            </button>
+            <button className="secondary-button" onClick={launchExtendOperator} type="button">
+              Extend Operator
+            </button>
+          </div>
+        </section>
+      );
+    }
+
+    if (phase === "extend-operator") {
+      return (
+        <section className="phase-screen">
+          <div className="phase-head">
+            <div>
+              <p className="eyebrow">Extend</p>
+              <h2>Extend operator</h2>
+            </div>
+            <span className="section-badge">Walrus renewal</span>
+          </div>
+          <p className="section-copy">
+            Select an owned operator and renew its storage window so it stays playable.
+          </p>
+          {!walletAddress ? (
+            <div className="notice-callout">Connect the wallet that owns the operator first.</div>
+          ) : extendLoading ? (
+            <div className="notice-callout">Loading extendable operators.</div>
+          ) : extendOperators.length > 0 ? (
+            <div className="operator-grid">
+              {extendOperators.map((operator) => {
+                const isSelected = operator.objectId === selectedExtendObjectId;
+                return (
+                  <button
+                    className={`operator-card${isSelected ? " active" : ""}`}
+                    key={operator.objectId}
+                    onClick={() => setSelectedExtendObjectId(operator.objectId)}
+                    type="button"
+                  >
+                    <img src={operator.previewUrl} alt={`${operator.name} preview`} />
+                    <div className="operator-card-copy">
+                      <strong>{operator.name}</strong>
+                      <p>{operator.role}</p>
+                      <span>{operator.prefabResource}</span>
+                    </div>
+                  </button>
+                );
+              })}
+            </div>
+          ) : (
+            <div className="notice-callout">
+              No extendable operator was found for this wallet yet.
+            </div>
+          )}
+          {selectedExtendOperator?.walrusStorage ? (
+            <div className="summary-grid">
+              <div className="summary-item">
+                <span>Time left</span>
+                <strong>
+                  {describeWalrusRetention(selectedExtendOperator.walrusStorage, walrusClock).shortLabel}
+                </strong>
+              </div>
+              <div className="summary-item">
+                <span>Expires</span>
+                <strong>
+                  {formatIsoDate(
+                    describeWalrusRetention(selectedExtendOperator.walrusStorage, walrusClock)
+                      .expiresAt,
+                  )}
+                </strong>
+              </div>
+            </div>
+          ) : null}
+          <div className="action-row">
+            <button className="secondary-button" onClick={previousPhase} type="button">
+              Back
+            </button>
+            <button
+              className="primary-button"
+              disabled={Boolean(renewBusyLabel) || !selectedExtendOperator?.walrusStorage}
+              onClick={() => void handleRenewExtendOperator()}
+              type="button"
+            >
+              {renewBusyLabel ?? "Extend Operator"}
+            </button>
+          </div>
+        </section>
+      );
+    }
+
+    return null;
+  };
+
+  return (
+    <div className="app-shell app-shell--minimal">
+      <header className="app-topbar">
+        <div className="brand-lockup">
+          <a className="brand-mark" href="/">
+            Pacific
+          </a>
+          <p className="brand-subtitle">Sui operator app</p>
         </div>
+        <SiteTabs activeRoute={activeRoute} />
         <div className="wallet-shell">
           <ConnectButton />
         </div>
       </header>
 
-      <section className="panel hero-banner create-hero-banner">
-        <div className="hero-banner-copy">
-          <span className="panel-label">Operator Foundry</span>
-          <h2>Mint once. Own the operator. Launch the same NFT into multiplayer.</h2>
-          <p>
-            Sui proves ownership, Walrus stores the runtime package and manifest, and the Unity
-            launcher injects the minted operator profile into MFPS. The critical path is now one
-            clear flow instead of a stack of setup panels.
-          </p>
-          <div className="status-chip-row">
-            {createStatusChips.map((chip) => (
-              <span className="status-chip" key={chip}>
-                {chip}
-              </span>
-            ))}
-          </div>
-          <div className="hero-stat-grid">
-            <article className="stat-card">
-              <span className="panel-label">Selected Operator</span>
-              <strong>{selectedOperatorLabel}</strong>
-              <p>Current live preset queued for mint and Unity handoff.</p>
-            </article>
-            <article className="stat-card">
-              <span className="panel-label">Wallet Prompts</span>
-              <strong>{estimatedWalletPromptCount}</strong>
-              <p>
-                Session verification, Walrus writes, and the final on-chain mint each need wallet
-                approval.
+      <main className="experience-shell">
+        {phase === "home" ? (
+          <section className="screen-hero screen-hero--mint">
+            <div className="screen-hero-copy">
+              <p className="eyebrow">Operator hub</p>
+              <h1>Mint or play.</h1>
+              <p className="lede">
+                Start with one decision. Mint a new operator or launch one you already own.
               </p>
-            </article>
-            <article className="stat-card">
-              <span className="panel-label">Save Session</span>
-              <strong>{walletSessionState}</strong>
-              <p>{walletSessionSummary}</p>
-            </article>
-            <article className="stat-card">
-              <span className="panel-label">Mint Readiness</span>
-              <strong>
-                {readinessCount}/{mintReadiness.length}
-              </strong>
-              <p>Required checks green before the mint button can fire.</p>
-            </article>
-          </div>
-          <div className="hero-action-row">
-            <a className="primary-button" href="#mint-command">
-              Open Mint Console
-            </a>
-            <a
-              className="secondary-button"
-              href={buildShooterLaunchHref(
-                publishState?.avatarObjectId ?? null,
-                publishState?.manifestBlob.blobId ?? null,
-              )}
-            >
-              Open Runtime Hub
-            </a>
-          </div>
-        </div>
-        <div className="hero-banner-media">
-          <div className="hero-media-frame">
-            <img src={heroPreviewImage} alt="Selected operator preview" />
-            <div className="hero-media-overlay">
-              <span className="panel-label">Live Preview</span>
-              <strong>{selectedShooterPreset?.label ?? "Awaiting operator selection"}</strong>
-              <p>{selectedShooterPreset?.tagline ?? "Select a shooter preset to preview the mint."}</p>
+              <div className="hero-chip-row">
+                <span className="hero-chip">{walletAddress ? formatWalletAddress(walletAddress) : "Connect wallet"}</span>
+                <span className="hero-chip">{selectedShooterPreset?.label ?? "Choose operator"}</span>
+                <span className="hero-chip">Walrus {walrusEpochPlan} epochs</span>
+              </div>
             </div>
-          </div>
-        </div>
-      </section>
-
-      <main className="create-layout">
-        <section className="create-left-rail">
-          <section className="panel upload-panel command-panel" id="mint-command">
-            <div className="panel-copy">
-              <span className="panel-label">Mint Console</span>
-              <h2>Connect, configure, sign, mint.</h2>
-              <p>
-                The mint button is the only action that matters here. Everything in this panel is
-                structured to make that path obvious and hard to misread.
-              </p>
+            <div className="screen-hero-art">
+              <img src={selectedPreviewArt} alt="Operator preview" />
+              <div className="hero-art-caption">
+                <span className="panel-label">Current preview</span>
+                <strong>{selectedShooterPreset?.label ?? "MPlayer 1"}</strong>
+                <p>{selectedShooterPreset?.tagline ?? "Pacific shooter runtime operator."}</p>
+              </div>
             </div>
-
-            <div className="step-grid">
-              <article className="validation-card step-card">
-                <span className="panel-label">Step 01</span>
-                <strong>{shooterSelected ? "Shooter locked" : "Choose shooter mode"}</strong>
-                <p>
-                  This build only mints MFPS-ready shooter operators, so mode selection is fixed
-                  before anything is uploaded.
-                </p>
-                <button
-                  className="mode-select-button"
-                  disabled={shooterSelected}
-                  onClick={chooseShooterMode}
-                >
-                  {shooterSelected ? "Shooter Locked In" : "Choose Shooter"}
-                </button>
-              </article>
-              <article className="validation-card step-card">
-                <span className="panel-label">Step 02</span>
-                <strong>Wallet verification</strong>
-                <p>{walletSessionSummary}</p>
-                <p className="helper-copy">
-                  Wallet: {walletAddress ?? "Connect a Sui wallet to arm the mint flow."}
-                </p>
-              </article>
-              <article className="validation-card step-card">
-                <span className="panel-label">Step 03</span>
-                <strong>{workflowPhase}</strong>
-                <p>{workflowDetail}</p>
-                <p className="helper-copy">Active manifest state: {activeStatus}</p>
-              </article>
-            </div>
-
-            <div className="field-grid">
-              <label className="field">
-                <span>Operator name</span>
-                <input
-                  value={name}
-                  disabled={!shooterSelected}
-                  onChange={(event) => setName(event.target.value)}
-                />
-              </label>
-
-              <label className="field field--full">
-                <span>Operator briefing</span>
-                <textarea
-                  rows={3}
-                  value={description}
-                  disabled={!shooterSelected}
-                  onChange={(event) => setDescription(event.target.value)}
-                />
-              </label>
-            </div>
-
-            <div className="validation-card signature-panel">
-              <div className="signature-panel-head">
-                <div>
-                  <span className="panel-label">Finish Every Signature</span>
-                  <strong>Wallet prompts are part of the mint path.</strong>
+          </section>
+        ) : (
+          <section className="phase-layout">
+            <aside className="phase-sidebar">
+              <div className="phase-preview">
+                <img src={selectedPreviewArt} alt="Selected operator preview" />
+                <div className="phase-preview-copy">
+                  <span className="panel-label">Operator</span>
+                  <strong>{selectedShooterPreset?.label ?? "Choose an operator"}</strong>
+                  <p>{selectedShooterPreset?.tagline ?? "Walk through the phases to mint."}</p>
                 </div>
-                <span className="signature-count">{estimatedWalletPromptCount} prompts expected</span>
               </div>
-              <ul className="signature-list">
-                {signatureChecklist.map((item) => (
-                  <li key={item}>{item}</li>
-                ))}
-              </ul>
-            </div>
-
-            <div className="notice-callout critical-callout">
-              VRM and large runtime uploads can take minutes. Do not close the tab, refresh,
-              switch wallets, or leave this page until the mint finishes and the launcher moves you
-              into the runtime.
-            </div>
-
-            <details
-              className="intel-drawer"
-              open={Boolean(sourceAssetFile || characterAssetFile)}
-            >
-              <summary>Optional creator files</summary>
-              <div className="drawer-content">
-                <label className="upload-drop">
-                  <span>
-                    Source Asset Archive
-                    <span className="upload-help">
-                      Optional archival/master file up to {formatLimitMb(webEnv.maxSourceAssetMb)}.
-                    </span>
-                  </span>
-                  <input
-                    type="file"
-                    disabled={!shooterSelected}
-                    onChange={(event) => handleSourceAssetChange(event.target.files?.[0] ?? null)}
-                  />
-                  <span className="upload-help">
-                    Stored on Walrus for archival or import workflows. Shooter runtime uses the
-                    minted manifest and runtime payload, not this source archive directly.
-                  </span>
-                </label>
-                {sourceAssetFile ? (
-                  <p className="upload-meta">Selected source asset: {formatFileMeta(sourceAssetFile)}</p>
-                ) : (
-                  <p className="upload-meta">No archival source asset attached. This is optional.</p>
-                )}
-
-                <label className="upload-drop">
-                  <span>
-                    Character Runtime Asset Override
-                    <span className="upload-help">
-                      Optional runtime file up to {formatLimitMb(webEnv.maxRuntimeAvatarMb)}.
-                    </span>
-                  </span>
-                  <input
-                    type="file"
-                    disabled={!shooterSelected}
-                    onChange={(event) => handleCharacterAssetChange(event.target.files?.[0] ?? null)}
-                  />
-                  <span className="upload-help">
-                    Leave empty to mint the selected MFPS preset descriptor. Uploading a custom VRM
-                    or character asset keeps the same Walrus flow, but the upload can take longer.
-                  </span>
-                </label>
-                {characterAssetFile ? (
-                  <p className="upload-meta">
-                    Character override selected: {formatFileMeta(characterAssetFile)}
-                  </p>
-                ) : (
-                  <p className="upload-meta">
-                    Using selected MFPS preset descriptor for the minted runtime payload.
-                  </p>
-                )}
-              </div>
-            </details>
-
-            <div className="cta-row">
-              <button
-                className="primary-button primary-button--wide"
-                disabled={!publishReady || !!busyLabel}
-                onClick={() => void handlePublish()}
-              >
-                {busyLabel ?? "Mint Shooter NFT on Walrus + Sui"}
-              </button>
-              <a
-                className="secondary-button"
-                href={buildShooterLaunchHref(
-                  publishState?.avatarObjectId ?? null,
-                  publishState?.manifestBlob.blobId ?? null,
-                )}
-              >
-                Launch Shooter Multiplayer
-              </a>
-            </div>
-
-            {!packageConfigured ? (
-              <div className="notice-callout">
-                Configure `VITE_AVATAR_PACKAGE_ID` with the published Avatar Move package before
-                on-chain mint can succeed.
-              </div>
-            ) : null}
-            {sourceAssetError ? <div className="error-callout">{sourceAssetError}</div> : null}
-            {walletSessionError ? <div className="error-callout">{walletSessionError}</div> : null}
-            {apiNotice ? <div className="notice-callout">{apiNotice}</div> : null}
-            {error ? <div className="error-callout">{error}</div> : null}
-          </section>
-        </section>
-
-        <aside className="create-right-rail">
-          <section className="panel operator-selection-panel">
-            <div className="panel-copy">
-              <span className="panel-label">Operator Deck</span>
-              <h2>Pick the operator players will actually see in MFPS.</h2>
-              <p>
-                These presets are the shooter characters mapped into the Unity runtime. The active
-                selection drives the NFT preview, prefab mapping, and launch profile.
-              </p>
-            </div>
-
-            <div className="shooter-character-grid">
-              {SHOOTER_CHARACTER_PRESETS.map((preset) => {
-                const active = preset.id === selectedShooterPreset?.id;
-                return (
-                  <button
-                    key={preset.id}
-                    type="button"
-                    className={`shooter-character-card${active ? " active" : ""}`}
-                    disabled={!shooterSelected}
-                    onClick={() => {
-                      setSelectedShooterPresetId(preset.id);
-                      setPublishState(null);
-                      setError(null);
-                    }}
-                  >
-                    <div className="shooter-character-thumb">
-                      <img src={preset.previewImagePath} alt={`${preset.label} operator preview`} />
+              <div className="phase-progress">
+                {phaseSteps.map((step, index) => {
+                  const isActive = step.key === phase;
+                  const isComplete =
+                    currentMintStepIndex >= 0 &&
+                    index <= currentMintStepIndex &&
+                    phase !== "extend-operator";
+                  return (
+                    <div
+                      className={`phase-progress-item${isActive ? " active" : ""}${isComplete ? " complete" : ""}`}
+                      key={step.key}
+                    >
+                      <span className="phase-progress-index">{index + 1}</span>
+                      <span className="phase-progress-label">{step.label}</span>
                     </div>
-                    <strong>{preset.label}</strong>
-                    <p>{preset.role}</p>
-                    <p className="shooter-character-meta">{preset.prefabResource}</p>
-                    <p className="shooter-character-meta">{preset.tagline}</p>
-                  </button>
-                );
-              })}
-            </div>
+                  );
+                })}
+                <div className={`phase-progress-item${phase === "extend-operator" ? " active" : ""}`}>
+                  <span className="phase-progress-index">E</span>
+                  <span className="phase-progress-label">Extend</span>
+                </div>
+              </div>
+              <div className="phase-sidebar-meta">
+                <p>Wallet: {formatWalletAddress(walletAddress)}</p>
+                <p>Status: {walletStatusLabel}</p>
+                <p>Mint status: {mintStatus}</p>
+              </div>
+            </aside>
+            <section className="phase-panel">{renderPhasePanel()}</section>
           </section>
+        )}
 
-          <section className="panel runtime-panel operator-spotlight-panel">
-            <div className="panel-copy">
-              <span className="panel-label">Spotlight</span>
-              <h2>{selectedShooterPreset?.label ?? "Choose an operator preset"}</h2>
-              <p>
-                This is the final operator card that feeds the mint preview, stats seed, and
-                runtime payload descriptor.
-              </p>
-            </div>
+        {phase === "home" ? renderPhasePanel() : null}
 
-            {previewUrl ? (
-              <div className="mint-preview-image runtime-preview-panel">
-                <img
-                  src={previewUrl}
-                  alt={`${selectedShooterPreset?.label ?? "Selected"} minted operator preview`}
-                />
-              </div>
-            ) : (
-              <div className="mint-preview-placeholder runtime-preview-panel">
-                Preview pending. Select an operator and the mint preview will generate here.
-              </div>
-            )}
-
-            <div className="stat-card-grid">
-              <article className="stat-card">
-                <span className="panel-label">Role</span>
-                <strong>{selectedShooterPreset?.role ?? "n/a"}</strong>
-                <p>Combat role baked into the launcher metadata.</p>
-              </article>
-              <article className="stat-card">
-                <span className="panel-label">Runtime</span>
-                <strong>{runtimeUploadPlan?.source ?? "n/a"}</strong>
-                <p>{runtimeUploadPlan?.filename ?? "No runtime payload selected yet."}</p>
-              </article>
-              <article className="stat-card">
-                <span className="panel-label">Stats Seed</span>
-                <strong>
-                  W {shooterInitialStats.wins} / L {shooterInitialStats.losses} / HP{" "}
-                  {shooterInitialStats.hp}
-                </strong>
-                <p>Initial NFT-linked shooter profile stored with the manifest.</p>
-              </article>
-              <article className="stat-card">
-                <span className="panel-label">Multiplayer Seed</span>
-                <strong>{shooterMultiplayerDefaults.maxPlayers} players</strong>
-                <p>
-                  {shooterMultiplayerDefaults.maxConcurrentMatches} matches /{" "}
-                  {shooterMultiplayerDefaults.tickRate}hz runtime budget.
-                </p>
-              </article>
-            </div>
-
-            <div className="validation-card mint-preview-card">
-              <div className="mint-preview-head">
-                <span className="panel-label">Mint Readiness</span>
-                <strong>
-                  {readinessCount === mintReadiness.length
-                    ? "Payload greenlit"
-                    : "Pending requirements"}
-                </strong>
-              </div>
-              <ul className="mint-readiness-list">
-                {mintReadiness.map((item) => (
-                  <li key={item.id} className={item.ready ? "ready" : "missing"}>
-                    <span>{item.label}</span>
-                    <em>{item.ready ? "ready" : "missing"}</em>
-                  </li>
-                ))}
-              </ul>
-              <p className={`mint-readiness-note${mintBlockingReasons.length > 0 ? "" : " ready"}`}>
-                {mintBlockingReasons.length > 0
-                  ? `Mint is blocked until: ${mintBlockingReasons.join(" ")}`
-                  : "Mint payload is complete and ready for Unity MFPS handoff."}
-              </p>
-            </div>
-
-            <details className="intel-drawer">
-              <summary>Minted object + relay intel</summary>
-              <div className="drawer-content status-grid">
-                <article>
-                  <span className="panel-label">Live state</span>
-                  <p>Workflow: {workflowPhase}</p>
-                  <p>{workflowDetail}</p>
-                  <p>Last active manifest blob: {activeManifestBlobId ?? "none"}</p>
-                  <p>Wallet: {walletAddress ?? "not connected"}</p>
-                </article>
-                <article>
-                  <span className="panel-label">Manifest payload</span>
-                  <p>Character ID: {selectedShooterPreset?.id ?? "n/a"}</p>
-                  <p>Prefab: {selectedShooterPreset?.prefabResource ?? "n/a"}</p>
-                  <p>Runtime mime: {runtimeUploadPlan?.mime ?? "n/a"}</p>
-                  <p>Runtime size: {formatBytes(runtimeUploadPlan?.size ?? null)}</p>
-                </article>
-                <article>
-                  <span className="panel-label">Mint result</span>
-                  {publishState ? (
-                    <>
-                      <p>Avatar object ID: {publishState.avatarObjectId}</p>
-                      <p>Manifest blob ID: {publishState.manifestBlob.blobId}</p>
-                      <p>Transaction: {publishState.manifestRecord.transactionDigest}</p>
-                      <p>Backend persistence: {publishState.apiPersisted ? "synced" : "local-only"}</p>
-                    </>
-                  ) : (
-                    <p>No on-chain mint has completed in this session yet.</p>
-                  )}
-                </article>
-              </div>
-            </details>
-          </section>
-        </aside>
+        {apiNotice ? <div className="notice-callout">{apiNotice}</div> : null}
+        {walletSessionError ? (
+          <div className="error-callout">Wallet verification error: {walletSessionError}</div>
+        ) : null}
+        {sourceAssetError ? <div className="error-callout">{sourceAssetError}</div> : null}
+        {error ? <div className="error-callout">{error}</div> : null}
+        {renewNotice ? <div className="notice-callout">{renewNotice}</div> : null}
+        {renewError ? <div className="error-callout">{renewError}</div> : null}
       </main>
     </div>
   );
