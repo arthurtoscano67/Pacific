@@ -1,0 +1,8 @@
+{
+  "manifestCacheSeconds": 300,
+  "assetCacheSeconds": 300,
+  "staleWhileRevalidateSeconds": 86400,
+  "network": "mainnet",
+  "readPath": "/asset/:blobId",
+  "manifestPath": "/manifest/:blobId"
+}

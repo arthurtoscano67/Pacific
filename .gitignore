@@ -1,0 +1,14 @@
+node_modules
+dist
+.env
+.env.local
+.env.production
+.DS_Store
+coverage
+.data
+.vite
+target
+apps/web/node_modules
+apps/api/node_modules
+apps/api/.data
+packages/shared/node_modules

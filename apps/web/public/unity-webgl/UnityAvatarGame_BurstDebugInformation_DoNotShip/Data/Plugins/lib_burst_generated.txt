@@ -1,0 +1,19 @@
+Library: /Users/arthurtoscano/Documents/New project/UnityAvatarGame/Temp/BurstOutput/Data/Plugins/lib_burst_generated
+--platform=Wasm
+--minimum-os-version=
+--backend=burst-llvm-19
+--target=WASM32
+--global-safety-checks-setting=Off
+--meta-data-generation=False
+--dump=Function
+--float-precision=Standard
+--target-framework=NetFramework
+--generate-link-xml=Temp/burst.link.xml
+--temp-folder=/Users/arthurtoscano/Documents/New project/UnityAvatarGame/Temp/Burst
+--generate-static-linkage-methods
+--key-folder=/Applications/Unity/Hub/Editor/6000.5.0a8/PlaybackEngines/WebGLSupport
+--decode-folder=/Users/arthurtoscano/Documents/New project/UnityAvatarGame/Library/Burst
+--output=/Users/arthurtoscano/Documents/New project/UnityAvatarGame/Temp/BurstOutput/Data/Plugins/lib_burst_generated
+--pdb-search-paths=Temp/ManagedSymbols/
+
+

@@ -1,0 +1,20 @@
+{
+  "name": "ready-avatar-platform",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "workspaces": [
+    "apps/web",
+    "apps/api",
+    "packages/shared"
+  ],
+  "scripts": {
+    "build": "npm run build -w @pacific/shared && npm run build -w @pacific/api && npm run build -w @pacific/web",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "dev:web": "npm run dev -w @pacific/web",
+    "dev:api": "npm run dev -w @pacific/api"
+  },
+  "engines": {
+    "node": ">=24.0.0"
+  }
+}

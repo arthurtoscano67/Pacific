@@ -1,0 +1,27 @@
+{
+  "name": "@pacific/api",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/server.ts",
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "start": "node dist/server.js"
+  },
+  "dependencies": {
+    "@fastify/cors": "^11.1.0",
+    "@mysten/sui": "^2.5.0",
+    "@mysten/walrus": "^1.0.3",
+    "@pacific/shared": "file:../../packages/shared",
+    "fastify": "^5.6.1",
+    "lru-cache": "^11.2.2",
+    "postgres": "^3.4.7",
+    "zod": "^4.1.12"
+  },
+  "devDependencies": {
+    "@types/node": "^24.10.1",
+    "tsx": "^4.20.6",
+    "typescript": "^5.9.3"
+  }
+}

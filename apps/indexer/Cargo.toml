@@ -1,0 +1,22 @@
+[package]
+name = "pacific-indexer"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.71"
+async-trait = "0.1.61"
+bcs = "0.1.4"
+clap = { version = "4.4", features = ["derive", "env"] }
+diesel = "2.2"
+diesel-async = { version = "0.5", features = ["postgres"] }
+diesel_migrations = "2.2"
+prometheus = "0.14.0"
+serde = { version = "1.0.144", features = ["derive"] }
+serde_json = { version = "1.0.95", features = ["preserve_order"] }
+tokio = { version = "1.48.0", features = ["macros", "rt-multi-thread"] }
+tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
+url = "2.3.1"
+
+sui-indexer-alt-framework = { git = "https://github.com/MystenLabs/sui.git", rev = "dc73efd65e59a16699af8615870efe77db0848d6", features = ["postgres"] }
+sui-types = { git = "https://github.com/MystenLabs/sui.git", rev = "dc73efd65e59a16699af8615870efe77db0848d6" }
